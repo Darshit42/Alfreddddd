@@ -68,6 +68,35 @@ that is not in the report.
 - If the line is unclear, ask them to repeat rather than guessing.\
 """
 
+QUESTION_PROMPT = """\
+You are Alfred, an AI operations worker, on a phone call with the colleague you work for. You are in the middle \
+of a task and are blocked on something only they can decide. They did not respond on screen, so you are calling. \
+Speak naturally and briefly. Speak English by default; if they speak Hindi or Hinglish, match them.
+
+The task you are working on: {task}
+
+What you need from them:
+{question}
+{options}
+How the call goes
+1. Greet them in one short sentence, say you are Alfred, and say in a few words what you are working on.
+2. Ask the question in plain spoken language. Do not read out long file paths, URLs or IDs; describe them. If \
+there are suggested answers, offer them briefly.
+3. When they answer, repeat it back in one sentence to confirm you understood.
+4. {capture}
+5. If they cannot decide right now, call `cannot_answer`.
+6. Say you will carry on, say goodbye, and call `end_call`.
+
+Rules
+- Do not answer the question yourself and do not push them towards an answer.
+- If the line is unclear, ask them to repeat rather than guessing. A wrong answer is worse than no answer.\
+"""
+CAPTURE_ANSWER = ("Once they confirm, call `submit_answer` with their answer written out clearly in English. If they "
+                  "picked one of the suggested answers, give that suggestion's text.")
+CAPTURE_DECISION = ("This is a request for permission. Only if they clearly say yes after your read-back, call "
+                    "`submit_decision` with approved=true. If they say no, or anything short of a clear yes, call it "
+                    "with approved=false.")
+
 FIRST_CALL_REPORT = "Nothing yet: this is the start of the session. Skip the report and ask what they would like done."
 
 
@@ -116,15 +145,27 @@ async def _dispatch(room: str, metadata: str) -> None:
         await lk.aclose()
 
 
-def call_user(phone: str, report: str = "", timeout: float = MAX_CALL_S + 90) -> dict:
+def call_user(phone: str, report: str = "") -> dict:
     """Ring `phone`, speak `report`, and return {"answered", "next_task", "transcript", "error"}."""
+    return _call(phone, {"mode": "report", "report": report or FIRST_CALL_REPORT})
+
+
+def ask_by_phone(phone: str, question: str, options: list[str] | None = None, task: str = "",
+                 approval: bool = False) -> dict:
+    """Ring `phone` with a mid-task question. Returns {"answered", "answer" | "approved", "transcript", "error"};
+    "answer" and "approved" are None when the user did not give one."""
+    return _call(phone, {"mode": "approval" if approval else "question", "question": question,
+                         "options": options or [], "task": task})
+
+
+def _call(phone: str, meta: dict, timeout: float = MAX_CALL_S + 90) -> dict:
     gaps = missing_config()
     if gaps:
         raise RuntimeError(f"Calling is not configured. Missing in .env: {', '.join(gaps)}")
     ensure_worker()
     call_id = uuid.uuid4().hex[:10]
     result_file = Path(tempfile.gettempdir()) / f"alfred-call-{call_id}.json"
-    metadata = json.dumps({"phone": phone, "report": report or FIRST_CALL_REPORT, "result_file": str(result_file)})
+    metadata = json.dumps({**meta, "phone": phone, "result_file": str(result_file)})
     # Dispatch on its own thread so this also works when the caller already runs an event loop.
     errors: list[Exception] = []
 
@@ -147,7 +188,8 @@ def call_user(phone: str, report: str = "", timeout: float = MAX_CALL_S + 90) ->
             result_file.unlink(missing_ok=True)
             return data
         time.sleep(1)
-    return {"answered": False, "next_task": None, "transcript": [], "error": "The call did not report back in time."}
+    return {"answered": False, "next_task": None, "answer": None, "approved": None, "transcript": [],
+            "error": "The call did not report back in time."}
 
 
 def spoken_report(task: str, outcome: dict) -> str:
@@ -160,13 +202,25 @@ def spoken_report(task: str, outcome: dict) -> str:
 
 
 # --------------------------------------------------------------------------- worker side (LiveKit agent process)
-def _build_agent(report: str):
+def _build_agent(meta: dict):
     from livekit.agents import Agent, RunContext, function_tool
+
+    mode = meta.get("mode", "report")
+    if mode == "report":
+        instructions = PROMPT.format(report=meta.get("report") or FIRST_CALL_REPORT)
+    else:
+        options = meta.get("options") or []
+        listed = ("Suggested answers:\n" + "\n".join(f"- {o}" for o in options) + "\n") if options else ""
+        instructions = QUESTION_PROMPT.format(
+            task=meta.get("task") or "(not given)", question=meta.get("question", ""), options=listed,
+            capture=CAPTURE_DECISION if mode == "approval" else CAPTURE_ANSWER)
 
     class IntakeAgent(Agent):
         def __init__(self) -> None:
-            super().__init__(instructions=PROMPT.format(report=report))
+            super().__init__(instructions=instructions)
             self.next_task: str | None = None
+            self.answer: str | None = None
+            self.approved: bool | None = None
             self.ended = False
             self.transcript: list[dict] = []
 
@@ -186,6 +240,24 @@ def _build_agent(report: str):
             """Call this when the colleague says there is nothing else to do."""
             self.next_task = None
             return "Understood. Say a short goodbye and end the call."
+
+        @function_tool
+        async def submit_answer(self, ctx: RunContext, answer: str) -> str:
+            """Call this once the colleague has answered your question and confirmed your read-back.
+            `answer` is their answer in clear written English."""
+            self.answer = answer.strip()
+            return "Answer recorded. Tell them you will carry on with the task, then end the call."
+
+        @function_tool
+        async def submit_decision(self, ctx: RunContext, approved: bool) -> str:
+            """Call this once the colleague has clearly said yes or no to the permission you asked for."""
+            self.approved = bool(approved)
+            return "Decision recorded. Tell them what you will now do, then end the call."
+
+        @function_tool
+        async def cannot_answer(self, ctx: RunContext) -> str:
+            """Call this if the colleague cannot answer or decide right now."""
+            return "Understood. Tell them the task will wait for them on screen, then end the call."
 
         @function_tool
         async def end_call(self, ctx: RunContext) -> str:
@@ -223,8 +295,9 @@ async def entrypoint(ctx) -> None:   # ctx: livekit.agents.JobContext
     from livekit.plugins.google.beta import realtime
 
     meta = json.loads(ctx.job.metadata or "{}")
-    result: dict = {"answered": False, "next_task": None, "transcript": [], "error": None}
-    agent = _build_agent(meta.get("report") or FIRST_CALL_REPORT)
+    result: dict = {"answered": False, "next_task": None, "answer": None, "approved": None, "transcript": [],
+                    "error": None}
+    agent = _build_agent(meta)
     session = None
     try:
         await ctx.connect()
@@ -269,7 +342,7 @@ async def entrypoint(ctx) -> None:   # ctx: livekit.agents.JobContext
             return
         result["answered"] = True
         await session.start(agent=agent, room=ctx.room)
-        await session.generate_reply(user_input="The call just connected. Start: greet them and give the report.")
+        await session.generate_reply(user_input="The call just connected. Start now: greet them and begin.")
 
         async def wait_for_end() -> None:
             while not closed.is_set():
@@ -288,7 +361,7 @@ async def entrypoint(ctx) -> None:   # ctx: livekit.agents.JobContext
     except Exception as exc:  # noqa: BLE001
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        result["next_task"] = agent.next_task
+        result["next_task"], result["answer"], result["approved"] = agent.next_task, agent.answer, agent.approved
         result["transcript"] = agent.transcript
         if meta.get("result_file"):
             Path(meta["result_file"]).write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")

@@ -11,6 +11,7 @@ and approvals that the CLI asks in the terminal appear here as dialogs.
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import threading
@@ -34,6 +35,7 @@ from .worker import RunConfig, run_task
 CONFIG = Path.home() / ".alfred" / "config.json"
 WORKSPACE = Path("workspace")
 SANDBOX_PORT = 8000
+AFK_SECONDS = float(os.environ.get("ALFRED_AFK_SECONDS", "45"))   # no reply on screen for this long -> phone the user
 
 
 class Session:
@@ -61,12 +63,43 @@ class Session:
         CONFIG.write_text(json.dumps(self.config))
 
     def ask_human(self, pending: dict):
-        """Called on the agent thread: show a dialog in the UI and block until it is answered."""
+        """Called on the agent thread: show a dialog in the UI and block until it is answered.
+
+        If nobody responds on screen within AFK_SECONDS and a phone number is known, the user is assumed to be
+        away from the keyboard: Alfred phones them, asks the same thing by voice, and uses that answer. If the
+        call gets no answer either, the dialog simply keeps waiting.
+        """
         self._answered.clear()
         self.pending = pending
-        self._answered.wait()
+        phone = self.config.get("phone")
+        if not self._answered.wait(AFK_SECONDS if phone else None):
+            self.pending = {**pending, "calling": True}
+            note = self._ask_by_phone(phone, pending)
+            if self.trace:
+                self.trace.event("harness", note=note)
+            if not self._answered.is_set():
+                self.pending = pending
+                self._answered.wait()
         self.pending = None
         return self._answer
+
+    def _ask_by_phone(self, phone: str, pending: dict) -> str:
+        from . import voice
+        approval = pending["kind"] == "approval"
+        question = f"May I go ahead with this action: {pending['text']}?" if approval else pending["text"]
+        try:
+            result = voice.ask_by_phone(phone, question, pending.get("options"), self.task, approval)
+        except Exception as e:  # noqa: BLE001
+            return f"No response on screen for {AFK_SECONDS:.0f}s; calling {phone} failed: {e}"
+        self.call = {"status": "Asked by phone", "transcript": result.get("transcript", [])}
+        value = result.get("approved") if approval else result.get("answer")
+        if self._answered.is_set():
+            return "The user answered on screen while the call was in progress; the on-screen answer is used."
+        if value is None:
+            return (f"No response on screen for {AFK_SECONDS:.0f}s; phoned {phone} but got no answer "
+                    f"({result.get('error') or 'none given'}). Still waiting on screen.")
+        self.answer(value)
+        return f"No response on screen for {AFK_SECONDS:.0f}s; phoned {phone}. Answer by phone: {value}"
 
     def answer(self, value) -> None:
         self._answer = value
@@ -74,13 +107,13 @@ class Session:
 
     def run(self, task: str, headed: bool, team: bool = False, phone: str = "") -> None:
         """One task, or with a phone number the loop: do the task, call with the result, take the next by voice."""
-        report = ""
-        if task:
-            report = self.run_one(task, headed, team)
-        if not phone:
-            return
         from . import voice
+        report = ""
         try:
+            if task:
+                report = self.run_one(task, headed, team)
+            if not phone:
+                return
             while True:
                 self.call = {"status": f"Calling {phone} ...", "transcript": []}
                 result = voice.call_user(phone, report)
@@ -321,9 +354,9 @@ td.pass{color:var(--ok);font-weight:600}td.fail{color:var(--bad);font-weight:600
     <div class="row"><label class="small"><input type="checkbox" id="headed"> Show browser</label>
     <label class="small" title="An overseer splits the request and dispatches role-scoped sub-agents"><input type="checkbox" id="team"> Overseer + sub-agents</label><span class="sp"></span>
     <button class="primary" id="run">Run</button></div>
-    <div class="row"><input type="text" id="phone" placeholder="Your phone, e.g. +919812345678 (optional)" style="flex:1">
+    <div class="row"><input type="text" id="phone" placeholder="Your phone, e.g. +919812345678" style="flex:1">
     <button id="callme" title="Alfred rings you and takes the task by voice">Call me for a task</button></div>
-    <div class="small mute" style="margin-top:4px">With a number filled in, Run also calls you with the result and takes the next task by voice.</div>
+    <div class="small mute" style="margin-top:4px">With a number filled in, Alfred calls you by itself: when a task is done (to report and take the next one by voice), and when it needs an answer and you have not responded on screen for 45 seconds.</div>
     <div class="row small mute"><a id="sandbox" href="#" target="_blank">Open the demo company</a><span class="sp"></span>
     <button id="reset" class="small">Reset demo data</button></div>
     <div class="error" id="runerr"></div></div>
@@ -414,9 +447,9 @@ async function tick() {
     const v = o.verified === true ? "Passed independent verification" : o.verified === false ? "Did NOT pass independent verification" : "Not verified";
     $("result").innerHTML = `<span class="status ${o.status}">${esc(o.status)}</span><p>${esc(o.summary)}</p><ul>${(o.details || []).map(d => `<li>${esc(d)}</li>`).join("")}</ul>` +
       (o.verdict ? checks(o.verdict) : "") + `<p class="mute small">${v}${o.steps ? " · " + o.steps + " steps" : ""}<br>Evidence report: ${esc(s.report || "")}</p>`; }
-  const p = s.pending, key = p ? p.kind + p.text : null;
+  const p = s.pending, key = p ? p.kind + p.text + (p.calling ? "c" : "") : null;
   if (key !== askShown) { askShown = key; $("ask").style.display = p ? "flex" : "none";
-    if (p) { const approval = p.kind === "approval"; $("asktitle").textContent = approval ? "Approval required" : "Alfred needs your input";
+    if (p) { const approval = p.kind === "approval"; $("asktitle").textContent = (approval ? "Approval required" : "Alfred needs your input") + (p.calling ? " · no response, calling you now…" : "");
       $("asktext").innerHTML = esc(p.text) + (approval ? `<div class="mute small">on ${esc(p.url)}</div>` : "");
       $("askfree").style.display = approval ? "none" : ""; $("askinput").value = "";
       $("askopts").innerHTML = (p.options || []).map(o => `<button style="display:block;margin:6px 0;text-align:left;width:100%" data-v="${esc(o)}">${esc(o)}</button>`).join("");
