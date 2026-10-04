@@ -9,3 +9,7 @@ workspace/downloads/
 workspace/.alfred/
 workspace/*.csv
 *.egg-info/
+# everything the worker writes; only the handbook and policy are source
+workspace/*
+!workspace/HANDBOOK.md
+!workspace/policy.json
