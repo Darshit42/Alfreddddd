@@ -7,6 +7,11 @@ openai>=1.40
 google-genai>=1.0
 pywebview>=5.0
 keyring>=24.0
+# phone mode (optional)
+livekit-agents>=1.0
+livekit-plugins-google>=1.0
+livekit-api>=1.0
+python-dotenv>=1.0
 # sandbox (the simulated company) only
 fastapi>=0.110
 uvicorn>=0.29

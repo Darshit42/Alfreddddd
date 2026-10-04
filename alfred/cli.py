@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -172,6 +173,8 @@ HELP = """[bold]Type a task in plain language and press Enter.[/]  Commands:
   /headed           toggle showing the browser window while it works
   /team             toggle the overseer (splits a request across role-scoped sub-agents)
   /connectors       list connectors (built and planned) and which roles get them
+  /call <number>    phone mode: Alfred rings you (E.164, e.g. +9198...), reports the last result,
+                    takes the next task by voice, does it, and calls back until you say you are done
   /add <task>       queue a task for later        /work    work through the queue unattended
   /status           queue, escalations, metrics   /answer <id> <reply>   answer an escalated task
   /help             this list                     /exit    quit"""
@@ -229,6 +232,31 @@ def apply_model(args, config: dict) -> None:
         os.environ[ENV_KEYS[args.provider]] = key
 
 
+def voice_loop(phone: str, last: tuple[str, dict] | None, args, store: Store, console: Console) -> None:
+    """Call, report, take a task by voice, do it, call back. Ends when the user has nothing more or does not answer."""
+    from . import voice
+    report = voice.spoken_report(*last) if last else ""
+    try:
+        while True:
+            with console.status(f"Calling {phone} ..."):
+                result = voice.call_user(phone, report)
+            for turn in result.get("transcript", []):
+                console.print(f"  [dim]{turn['role']}:[/] {escape(turn['text'])}")
+            if not result.get("answered"):
+                console.print(f"[yellow]The call was not answered[/] ({result.get('error') or 'no answer'}).")
+                return
+            task = result.get("next_task")
+            if not task:
+                console.print("No further task given on the call." + (f" ({result['error']})" if result.get("error") else ""))
+                return
+            console.print(Panel(escape(task), title="Task taken by phone", border_style="cyan"))
+            report = voice.spoken_report(task, execute(task, args, store, console, interactive=True, approve="ask"))
+    except RuntimeError as e:
+        console.print(f"[red]{escape(str(e))}[/]")
+    finally:
+        voice.stop_worker()
+
+
 def repl(console: Console) -> int:
     """Interactive session: one prompt, tasks in plain language, slash commands for everything else."""
     args = build_parser().parse_args(["run", "-"])
@@ -242,6 +270,7 @@ def repl(console: Console) -> int:
     if config.get("provider"):
         apply_model(args, config)
         console.print(f"[dim]Model: {PROVIDERS[args.provider]}" + (f" · {args.model}" if args.model else "") + "[/]")
+    last: tuple[str, dict] | None = None
     while True:
         try:
             line = Prompt.ask("\n[bold cyan]alfred[/]").strip()
@@ -292,6 +321,14 @@ def repl(console: Console) -> int:
                 console.print(f"  role [bold]{name}[/]: {', '.join(role.connectors)}")
         elif cmd == "/status":
             cmd_status(store, console)
+        elif cmd == "/call":
+            if not re.fullmatch(r"\+\d{8,15}", rest):
+                console.print("Usage: /call +919812345678  (your number with country code)")
+            elif not args.provider:
+                console.print("[yellow]No model connected yet.[/] Use /model.")
+            else:
+                voice_loop(rest, last, args, store, console)
+                last = None
         elif cmd == "/add" and rest:
             console.print(f"Queued as task {store.add(rest)}.")
         elif cmd == "/answer" and rest.partition(" ")[0].isdigit():
@@ -306,7 +343,7 @@ def repl(console: Console) -> int:
             args.once = False
             cmd_work(args, store, console)
         else:
-            execute(line, args, store, console, interactive=True, approve="ask")
+            last = (line, execute(line, args, store, console, interactive=True, approve="ask"))
 
 
 def main(argv: list[str] | None = None) -> int:

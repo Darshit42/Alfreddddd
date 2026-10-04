@@ -75,6 +75,27 @@ alfred
 demo company, `/headed` shows the browser, `/model` switches provider, `/add`, `/work`, `/status` and
 `/answer` drive the queue, `/help` lists everything.
 
+### Phone mode
+
+```
+alfred
+/call +9198XXXXXXXX
+```
+
+Alfred rings that number, reports the result of the last task (or asks what you want if there is none),
+takes the next task by voice, hangs up, does the work, and calls back with the result. It keeps going until
+you say there is nothing else or do not pick up. Questions and approvals during the work still appear in
+the terminal.
+
+It needs `.env` filled in from `.env.example`: a LiveKit project, an outbound SIP trunk and a Google API key
+(Gemini Live does the speech). `alfred/voice.py` has the two halves: a LiveKit agent that makes the call,
+and `call_user()` which dispatches it and waits for what was said. What the voice model says changes
+nothing; a spoken request only becomes work through its `submit_task` tool, and that task then runs through
+the same worker, enforcer and verification as a typed one.
+
+**Status:** credentials, the SIP trunk and the voice worker's registration were checked; a full call
+(dial, speak, capture a task) has not been run end to end yet.
+
 ## Run: one-off commands
 
 Terminal 1, the simulated company (intranet with a mail inbox and a bills system):
@@ -350,6 +371,7 @@ or `incomplete`. The exit code is 0 only for verified success.
   machine. That is fine for personal use and this demo; a product offered to other people should use
   API keys, since Anthropic does not allow third-party products to run on users' subscription logins.
 - **pywebview** for the desktop window, **keyring** for credential storage.
+- **Phone mode:** LiveKit Agents, an outbound SIP trunk, and Gemini Live for speech in and out.
 - **Anthropic Python SDK** for the API call. The agent loop, tools, verifier and policy are written
   from scratch; no agent framework.
 - **Playwright** (Chromium) for the browser, **pypdf** for reading PDFs, **rich** for the console.
