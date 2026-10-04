@@ -268,8 +268,8 @@ def _build_agent(meta: dict):
     return IntakeAgent()
 
 
-async def _dial(ctx, phone: str) -> bool:
-    """Ring the user into the room. True once answered; False for no answer, busy or declined."""
+async def _dial(ctx, phone: str) -> str:
+    """Ring the user into the room. Returns "" once answered, else why the call did not connect."""
     from google.protobuf.duration_pb2 import Duration
     from livekit.protocol.sip import CreateSIPParticipantRequest
     req = CreateSIPParticipantRequest(
@@ -279,13 +279,9 @@ async def _dial(ctx, phone: str) -> bool:
         req.sip_number = os.environ["SIP_CALLER_ID"]
     try:
         await ctx.api.sip.create_sip_participant(req)
-        return True
-    except Exception as exc:  # noqa: BLE001
-        text = f"{type(exc).__name__}: {exc}".lower()
-        if any(t in text for t in ("no answer", "busy", "declined", "rejected", "not found", "unavailable",
-                                   "timeout", "canceled", "cancelled", "486", "480", "603", "404")):
-            return False
-        raise
+        return ""
+    except Exception as exc:  # noqa: BLE001 - keep the carrier's own reason: it is the only clue the user gets
+        return f"{type(exc).__name__}: {exc}"[:300]
 
 
 async def entrypoint(ctx) -> None:   # ctx: livekit.agents.JobContext
@@ -337,8 +333,9 @@ async def entrypoint(ctx) -> None:   # ctx: livekit.agents.JobContext
         def _close(_ev) -> None:
             closed.set()
 
-        if not await _dial(ctx, meta["phone"]):
-            result["error"] = "no answer"
+        failure = await _dial(ctx, meta["phone"])
+        if failure:
+            result["error"] = f"the call did not connect: {failure}"
             return
         result["answered"] = True
         await session.start(agent=agent, room=ctx.room)
