@@ -1,4 +1,4 @@
-# Alfred — an autonomous AI task worker
+# Alfred — an autonomous AI employee prototype
 
 Give Alfred a task in plain language. It works out the steps, does them in a real browser and a file
 workspace, recovers when things break, checks with you when it should not guess, and has its result
@@ -13,9 +13,31 @@ in. Nothing about the task is hard-coded in the agent.
 
 > Demo video: _add link here_
 
+## How this maps to an AI-employee platform
+
+| Platform layer | In Alfred | Where |
+|---|---|---|
+| Reasoning engine: plans multi-step actions | Model-driven loop; success criteria fixed before acting | `loop.py`, `worker.py` |
+| Tool execution: acts in your systems | Browser and file tools; any model provider | `tools/`, `providers.py` |
+| Company memory: learns your context | Handbook + lessons kept across runs | `workspace/HANDBOOK.md`, `lessons.json` |
+| Permission layer: enforces access rules | Enforcer on every request: allow / approve / never | `policy.py`, `workspace/policy.json` |
+| Human escalation: hands off when unsure | Questions and approvals; `needs_human` queue state | `worker.py`, `store.py` |
+| Observability: logs every action | Append-only decision log, screenshots, HTML report | `store.py`, `trace.py` |
+| Outcome you can trust | Independent read-only verification of every "done" | `verifier.py` |
+
+Not built: a workflow engine (the model plans each run from scratch), knowledge retrieval over documents,
+and per-role permissions (there is one policy per workspace).
+
 ## Setup
 
-Requires Python 3.11+ and an Anthropic API key.
+Requires Python 3.11+ and one way to reach a model:
+
+| Provider | How | Status |
+|---|---|---|
+| Claude subscription | Claude Code installed and signed in (`claude`); no key | Run live end to end |
+| Claude API | `ANTHROPIC_API_KEY` | Implemented; not run live (no key during development) |
+| OpenAI | `OPENAI_API_KEY` | Implemented; not run live |
+| Google Gemini | `GEMINI_API_KEY` | Implemented; not run live |
 
 ```bash
 python -m venv .venv
@@ -24,9 +46,22 @@ pip install -r requirements.txt
 python -m playwright install chromium   # optional: falls back to installed Chrome or Edge
 ```
 
-Set the key (PowerShell: `$env:ANTHROPIC_API_KEY = "sk-ant-..."`, bash: `export ANTHROPIC_API_KEY=...`).
+For the CLI, set a key in the environment (PowerShell: `$env:ANTHROPIC_API_KEY = "sk-ant-..."`), or just have
+Claude Code signed in. `--provider` and `--model` override the automatic choice.
 
-## Run
+## Run: desktop app
+
+```bash
+python -m alfred.app
+```
+
+A native window opens. On first start it asks how to connect a model: paste a Claude, OpenAI or Gemini key
+(validated against the provider before it is saved, and stored in the OS credential store, not in a file),
+or choose the Claude subscription option. The demo company starts with the app. Type a task or pick an
+example, press Run, and watch the worker's browser, its reasoning, every enforcer verdict and the
+independent verification live. Questions and approvals appear as dialogs.
+
+## Run: command line
 
 Terminal 1, the simulated company (intranet with a mail inbox and a bills system):
 
@@ -197,6 +232,11 @@ or `incomplete`. The exit code is 0 only for verified success.
 
 ## Known limitations
 
+- **Verified live with one provider.** Two tasks (invoice entry; an approval-gated payment) were run end
+  to end on Claude via Claude Code. The Anthropic-key, OpenAI and Gemini adapters are written against
+  their SDKs but have not been run, and the cost cap only knows Claude prices.
+- **The desktop app is a Python app in a native window**, not a packaged installer. It runs one task at
+  a time; the queue is CLI-only.
 - **Only exercised live in the sandbox.** Real sites bring iframes, shadow DOM, infinite scroll, popups
   and bot detection; the snapshot does not handle iframes or shadow DOM today.
 - **The enforcer's default rules are keyword-based** (on the request path and the control label). A
@@ -229,9 +269,16 @@ or `incomplete`. The exit code is 0 only for verified success.
 
 ## Models, APIs and components used
 
-- **Model:** Claude Opus 5.5 (`claude-opus-5-5`) through the Anthropic Messages API with tool use,
-  adaptive thinking (summarised, so the trace shows why each step was taken) and prompt caching.
-  Override with `ALFRED_MODEL` / `ALFRED_EFFORT`.
+- **Model:** provider-neutral. The loop speaks one message format and `providers.py` adapts it to Claude
+  (Anthropic Messages API with tool use, adaptive thinking and prompt caching), OpenAI (Chat Completions
+  function calling), Gemini (function calling), or Claude Code. The live runs during development used
+  Claude Opus 5.5 through Claude Code.
+- **Claude Code as a model backend:** each step is one headless `claude -p` call with Claude Code's own
+  tools switched off and the reply constrained to a JSON schema of tool calls, so Alfred's harness
+  (enforcer, verifier, budgets) stays in charge. It uses the login of whoever runs it, on their own
+  machine. That is fine for personal use and this demo; a product offered to other people should use
+  API keys, since Anthropic does not allow third-party products to run on users' subscription logins.
+- **pywebview** for the desktop window, **keyring** for credential storage.
 - **Anthropic Python SDK** for the API call. The agent loop, tools, verifier and policy are written
   from scratch; no agent framework.
 - **Playwright** (Chromium) for the browser, **pypdf** for reading PDFs, **rich** for the console.

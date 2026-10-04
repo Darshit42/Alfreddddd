@@ -153,6 +153,20 @@ def test_enforcer_gates_the_actual_request(sandbox, session):
     assert next(b for b in bills if b["id"] == 2)["status"] == "unpaid"
 
 
+def test_slow_human_approval_still_yields_the_resulting_page(sandbox, session):
+    import time
+
+    def slow_yes(action, url):
+        time.sleep(4)          # a person reading the approval dialog
+        return True
+
+    browser = session.open("w", enforcer=Enforcer(slow_yes))
+    login(browser, sandbox.url)
+    obs = browser.navigate(f"{sandbox.url}/ledger/bills/2").text
+    after = browser.click(ref(obs, "button", "Mark as paid")).text
+    assert "Status | paid" in after
+
+
 def test_enforcer_judges_the_operation_not_the_label():
     e = Enforcer(always_deny)
     assert e.check("POST", "http://x/ledger/bills/new", "Save bill")[0]

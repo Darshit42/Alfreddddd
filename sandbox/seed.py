@@ -191,12 +191,12 @@ def seed(reset: bool = False) -> None:
         pdf = ATTACH_DIR / f"{inv['number']}.pdf"
         if reset or not pdf.exists():
             write_invoice_pdf(inv, pdf)
-    if DB_PATH.exists():
-        if not reset:
-            return
-        DB_PATH.unlink()
+    if DB_PATH.exists() and not reset:
+        return
     db = sqlite3.connect(DB_PATH)
+    # Drop rather than delete the file: on Windows an open connection elsewhere keeps the file locked.
     db.executescript("""
+        DROP TABLE IF EXISTS audit; DROP TABLE IF EXISTS bills; DROP TABLE IF EXISTS vendors;
         CREATE TABLE vendors (id INTEGER PRIMARY KEY, name TEXT UNIQUE, contact_email TEXT, gstin TEXT);
         CREATE TABLE bills (
             id INTEGER PRIMARY KEY, vendor_id INTEGER REFERENCES vendors(id), invoice_number TEXT,

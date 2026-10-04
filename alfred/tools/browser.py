@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
@@ -151,6 +152,7 @@ class Browser:
         self._status: int | None = None
         self._downloads: list = []
         self._blocked: list[str] = []
+        self._held = False
         self.page.on("response", self._on_response)
         self.page.on("download", self._on_download)
         # Every request goes through the guard: enforcement happens on what is actually sent.
@@ -175,7 +177,9 @@ class Browser:
                                  f"{req.method} {req.url}.")
             return route.abort()
         if self.enforcer:
+            started = time.time()
             allowed, reason = self.enforcer.check(req.method, req.url, self._clicked, self.page.url)
+            self._held = self._held or time.time() - started > 0.5   # a human was asked: the page is behind
             if not allowed:
                 self._blocked.append(reason)
                 return route.abort()
@@ -258,9 +262,14 @@ class Browser:
         self._blocked.clear()
         self._status = None
         self._clicked = label
+        self._held = False
         try:
             loc.click()
             self._settle()
+            if self._held:
+                # The request sat waiting for approval; give the released navigation time to land.
+                self.page.wait_for_timeout(500)
+                self._settle()
         finally:
             self._clicked = ""
         if self._blocked:
