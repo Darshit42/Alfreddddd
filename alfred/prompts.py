@@ -77,11 +77,19 @@ result. Overall is `pass` only if every criterion passes, `fail` if any fails, o
 """
 
 
-def worker_brief(task: str, today: str, handbook: str, lessons: dict[str, str], earlier: str = "") -> str:
+def worker_brief(task: str, today: str, handbook: str, lessons: dict[str, str], earlier: str = "",
+                 workspace: str = "") -> str:
+    import os
+    from pathlib import Path
+    where = (f"\nYou are running on your colleague's own computer. Alfred was started from the folder "
+             f"{os.getcwd()} (Alfred's own project folder: its code, README and past runs are there). Your "
+             f"workspace is {workspace or 'the workspace folder inside it'}. Their home folder is {Path.home()}. "
+             "When they refer to a project or file on their PC, look in the folder Alfred was started from and "
+             "its parent folder before searching more widely.")
     parts = [f"<task>\n{task}\n</task>",
              f"<context>\nToday's date is {today}.\nRelative file paths are inside your workspace directory, and "
              "files downloaded by the browser are saved to downloads/ there. You can also read files anywhere on "
-             "this computer by absolute path; you can only write inside the workspace.\n</context>"]
+             "this computer by absolute path; you can only write inside the workspace." + where + "\n</context>"]
     if handbook.strip():
         parts.append(f"<company_handbook>\n{handbook.strip()}\n</company_handbook>")
     if lessons:

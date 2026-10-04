@@ -203,7 +203,7 @@ def spoken_report(task: str, outcome: dict) -> str:
 
 # --------------------------------------------------------------------------- worker side (LiveKit agent process)
 def _build_agent(meta: dict):
-    from livekit.agents import Agent, RunContext, function_tool
+    from livekit.agents import Agent, function_tool
 
     mode = meta.get("mode", "report")
     if mode == "report":
@@ -229,38 +229,38 @@ def _build_agent(meta: dict):
                 self.transcript.append({"role": role, "text": text.strip()})
 
         @function_tool
-        async def submit_task(self, ctx: RunContext, task: str) -> str:
+        async def submit_task(self, task: str) -> str:
             """Call this once the colleague has stated the next task and confirmed your read-back.
             `task` is the full task in clear written English with every detail they gave."""
             self.next_task = task.strip()
             return "Task recorded. Tell them you are on it and will call back when it is done, then end the call."
 
         @function_tool
-        async def no_more_tasks(self, ctx: RunContext) -> str:
+        async def no_more_tasks(self) -> str:
             """Call this when the colleague says there is nothing else to do."""
             self.next_task = None
             return "Understood. Say a short goodbye and end the call."
 
         @function_tool
-        async def submit_answer(self, ctx: RunContext, answer: str) -> str:
+        async def submit_answer(self, answer: str) -> str:
             """Call this once the colleague has answered your question and confirmed your read-back.
             `answer` is their answer in clear written English."""
             self.answer = answer.strip()
             return "Answer recorded. Tell them you will carry on with the task, then end the call."
 
         @function_tool
-        async def submit_decision(self, ctx: RunContext, approved: bool) -> str:
+        async def submit_decision(self, approved: bool) -> str:
             """Call this once the colleague has clearly said yes or no to the permission you asked for."""
             self.approved = bool(approved)
             return "Decision recorded. Tell them what you will now do, then end the call."
 
         @function_tool
-        async def cannot_answer(self, ctx: RunContext) -> str:
+        async def cannot_answer(self) -> str:
             """Call this if the colleague cannot answer or decide right now."""
             return "Understood. Tell them the task will wait for them on screen, then end the call."
 
         @function_tool
-        async def end_call(self, ctx: RunContext) -> str:
+        async def end_call(self) -> str:
             """Call this to hang up once the conversation is finished."""
             self.ended = True
             return "__END_CALL__"

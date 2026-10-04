@@ -153,7 +153,7 @@ def run_task(task: str, llm, cfg: RunConfig, trace: Trace, announce: bool = True
     granted = {"browser": browser.tools(), "files": workspace.tools()}
     tools = Toolset([t for name in cfg.connectors for t in granted[name]] + control)
     messages = [{"role": "user", "content": worker_brief(task, today, cfg.handbook, lessons.items,
-                                                            cfg.earlier_attempts)}]
+                                                            cfg.earlier_attempts, str(workspace.root))}]
 
     try:
         end = run_loop(llm=llm, system=WORKER_SYSTEM, messages=messages, tools=tools, trace=trace,
