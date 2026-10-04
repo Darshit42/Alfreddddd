@@ -8,3 +8,4 @@ sandbox/data/
 workspace/downloads/
 workspace/.alfred/
 workspace/*.csv
+*.egg-info/

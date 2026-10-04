@@ -61,7 +61,19 @@ or choose the Claude subscription option. The demo company starts with the app. 
 example, press Run, and watch the worker's browser, its reasoning, every enforcer verdict and the
 independent verification live. Questions and approvals appear as dialogs.
 
-## Run: command line
+## Run: terminal
+
+```bash
+pip install -e .      # once: installs the `alfred` and `alfred-app` commands
+alfred
+```
+
+`alfred` with no arguments opens an interactive session. On first start it asks which model to connect
+(same choices as the desktop app, same keyring). Then type tasks in plain language; `/demo` starts the
+demo company, `/headed` shows the browser, `/model` switches provider, `/add`, `/work`, `/status` and
+`/answer` drive the queue, `/help` lists everything.
+
+## Run: one-off commands
 
 Terminal 1, the simulated company (intranet with a mail inbox and a bills system):
 
@@ -144,7 +156,8 @@ layer** (the model) is invoked for one thing only: the judgment of how to carry 
   every tool call gets an observation back, including failures.
 - **`tools/browser.py`** — Playwright. The model sees a text rendering of the visible page where each
   interactive element has a ref (`[e12 link "Invoice KL-2026-0926…"]`) and acts by ref.
-- **`tools/files.py`** — list/read/write confined to the workspace. PDFs are read as text.
+- **`tools/files.py`** — list and read anywhere on the machine (the worker runs locally, for its owner);
+  writes are confined to the workspace so a run cannot overwrite the user's own files. PDFs are read as text.
 - **`worker.py`** — the four control tools (`plan`, `remember`, `ask_user`, `finish`) and the outcome logic.
 - **`verifier.py`** — independent check of a claimed success.
 - **`policy.py`** — the enforcer: rules on the requests the browser actually sends.

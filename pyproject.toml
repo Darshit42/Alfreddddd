@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alfred-worker"
+version = "0.1.0"
+description = "Alfred: an autonomous AI employee prototype (browser + files, verified outcomes)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=1.0", "openai>=1.40", "google-genai>=1.0",
+    "playwright>=1.45", "pypdf>=4.0", "rich>=13.0", "keyring>=24.0", "pywebview>=5.0",
+    "fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9", "reportlab>=4.0", "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+alfred = "alfred.cli:main"
+alfred-app = "alfred.app:main"
+
+[tool.setuptools]
+packages = ["alfred", "alfred.tools", "sandbox"]

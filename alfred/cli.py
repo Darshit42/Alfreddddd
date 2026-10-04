@@ -1,6 +1,7 @@
 """Command line.
 
-  python -m alfred "task"                 do one task now, with you at the terminal
+  alfred                                  interactive session (like a shell for tasks)
+  alfred "task"                           do one task now, with you at the terminal
   python -m alfred add "task"             put a task on the queue
   python -m alfred work                   work through the queue unattended
   python -m alfred status                 queue, escalations and metrics
@@ -9,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from datetime import datetime
@@ -21,7 +23,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from .policy import always_deny, auto_approve
-from .providers import ENV_KEYS, PROVIDERS, detect_provider, make_llm
+from .providers import ENV_KEYS, PROVIDERS, detect_provider, list_models, make_llm
 from .store import Store, prior_attempts_note
 from .trace import Trace
 from .worker import RunConfig, run_task
@@ -158,8 +160,145 @@ def cmd_status(store: Store, console: Console) -> int:
     return 0
 
 
+HELP = """[bold]Type a task in plain language and press Enter.[/]  Commands:
+  /model            connect or change the model (Claude, OpenAI, Gemini, or Claude subscription)
+  /demo             start the demo company (mail inbox + bills system) on http://127.0.0.1:8000
+  /reset            reset the demo company's data
+  /headed           toggle showing the browser window while it works
+  /add <task>       queue a task for later        /work    work through the queue unattended
+  /status           queue, escalations, metrics   /answer <id> <reply>   answer an escalated task
+  /help             this list                     /exit    quit"""
+
+
+def load_config() -> dict:
+    path = Path.home() / ".alfred" / "config.json"      # shared with the desktop app
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def setup_model(console: Console) -> dict | None:
+    """First-run (or /model) setup: pick a provider, validate the credential, store it in the OS keyring."""
+    import keyring
+    ids = list(PROVIDERS)
+    console.print("\n[bold]Connect a model[/]")
+    for i, pid in enumerate(ids, 1):
+        console.print(f"  {i}. {PROVIDERS[pid]}")
+    choice = Prompt.ask("Choose", choices=[str(i) for i in range(1, len(ids) + 1)], default="2")
+    provider = ids[int(choice) - 1]
+    key = ""
+    if provider != "claude-code":
+        key = Prompt.ask("API key (input hidden; Enter to reuse a saved key)", password=True).strip() \
+            or keyring.get_password("alfred", provider) or ""
+        if not key:
+            console.print("[red]No key entered.[/]")
+            return None
+    with console.status("Checking the connection..."):
+        try:
+            models = list_models(provider, key or None)
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red]Could not connect:[/] {escape(str(e).splitlines()[0][:300])}")
+            return None
+    if key:
+        keyring.set_password("alfred", provider, key)
+    model = models[0]
+    if len(models) > 1:
+        shown = models[:12]
+        for i, m in enumerate(shown, 1):
+            console.print(f"  {i}. {m}")
+        model = shown[int(Prompt.ask("Model", choices=[str(i) for i in range(1, len(shown) + 1)], default="1")) - 1]
+    config = load_config() | {"provider": provider, "model": model, "models": models}
+    path = Path.home() / ".alfred" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config))
+    console.print(f"[green]Connected:[/] {PROVIDERS[provider]} · {model}")
+    return config
+
+
+def apply_model(args, config: dict) -> None:
+    """Point a run at the configured provider, handing its key to the SDK through the environment."""
+    import keyring
+    args.provider, args.model = config["provider"], config.get("model")
+    key = keyring.get_password("alfred", args.provider) if args.provider in ENV_KEYS else None
+    if key:
+        os.environ[ENV_KEYS[args.provider]] = key
+
+
+def repl(console: Console) -> int:
+    """Interactive session: one prompt, tasks in plain language, slash commands for everything else."""
+    args = build_parser().parse_args(["run", "-"])
+    store = Store(Path(args.workspace) / ".alfred" / "alfred.db")
+    console.print(Panel("[bold]Alfred[/] · autonomous AI worker\nType a task, or /help for commands.",
+                        border_style="cyan", expand=False))
+    config = load_config()
+    if not config.get("provider"):
+        env = detect_provider()
+        config = {"provider": env} if env and env != "claude-code" else (setup_model(console) or {})
+    if config.get("provider"):
+        apply_model(args, config)
+        console.print(f"[dim]Model: {PROVIDERS[args.provider]}" + (f" · {args.model}" if args.model else "") + "[/]")
+    while True:
+        try:
+            line = Prompt.ask("\n[bold cyan]alfred[/]").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return 0
+        if not line:
+            continue
+        cmd, _, rest = line.partition(" ")
+        rest = rest.strip()
+        if cmd in ("/exit", "/quit"):
+            return 0
+        if cmd == "/help":
+            console.print(HELP)
+        elif cmd == "/model":
+            config = setup_model(console) or config
+            if config.get("provider"):
+                apply_model(args, config)
+        elif cmd == "/demo":
+            import socket
+            with socket.socket() as s:
+                up = s.connect_ex(("127.0.0.1", 8000)) == 0
+            if not up:
+                from sandbox.app import create_app
+
+                from .app import _serve
+                _serve(create_app(), 8000)
+            console.print("Demo company is running at http://127.0.0.1:8000/ (handbook: workspace/HANDBOOK.md)")
+        elif cmd == "/reset":
+            import httpx
+            try:
+                httpx.post("http://127.0.0.1:8000/__sandbox/reset", timeout=10)
+                console.print("Demo data reset.")
+            except httpx.HTTPError:
+                console.print("[red]The demo company is not running.[/] Start it with /demo.")
+        elif cmd == "/headed":
+            args.headed = not args.headed
+            args.slow = 250 if args.headed else 0
+            console.print(f"Browser window: {'shown' if args.headed else 'hidden'}")
+        elif cmd == "/status":
+            cmd_status(store, console)
+        elif cmd == "/add" and rest:
+            console.print(f"Queued as task {store.add(rest)}.")
+        elif cmd == "/answer" and rest.partition(" ")[0].isdigit():
+            tid, _, text = rest.partition(" ")
+            ok = store.answer(int(tid), text.strip())
+            console.print(f"Task {tid} requeued with your reply." if ok else f"[red]Task {tid} is not waiting for a human.[/]")
+        elif cmd.startswith("/") and cmd != "/work":
+            console.print(f"Unknown command {escape(cmd)}. /help lists them.")
+        elif not args.provider:
+            console.print("[yellow]No model connected yet.[/] Use /model.")
+        elif cmd == "/work":
+            args.once = False
+            cmd_work(args, store, console)
+        else:
+            execute(line, args, store, console, interactive=True, approve="ask")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv and sys.stdin.isatty():
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        return repl(Console())
     if argv and argv[0] not in COMMANDS and argv[0] not in ("-h", "--help"):
         argv.insert(0, "run")   # python -m alfred "task" is shorthand for: run "task"
     args = build_parser().parse_args(argv)

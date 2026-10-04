@@ -1,4 +1,6 @@
-"""File tools, confined to the workspace directory."""
+"""File tools. Reading works anywhere on this computer (the worker runs locally,
+for its owner). Writing is confined to the workspace so a run cannot overwrite
+the user's own files."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,14 +15,16 @@ class Workspace:
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def resolve(self, path: str) -> Path:
-        p = (self.root / path).resolve()
-        if p != self.root and self.root not in p.parents:
-            raise ToolError(f"'{path}' is outside the workspace. Use paths relative to the workspace root.")
+    def resolve(self, path: str, write: bool = False) -> Path:
+        p = (self.root / Path(path).expanduser()).resolve()   # an absolute path replaces the root
+        if write and p != self.root and self.root not in p.parents:
+            raise ToolError(f"'{path}' is outside the workspace. Files can be read anywhere but only written "
+                            "inside the workspace; use a path relative to the workspace root.")
         return p
 
     def rel(self, p: Path) -> str:
-        return p.resolve().relative_to(self.root).as_posix()
+        p = p.resolve()
+        return p.relative_to(self.root).as_posix() if self.root in p.parents else p.as_posix()
 
     # ------------------------------------------------------------------ tools
     def list_files(self, path: str = ".") -> str:
@@ -52,17 +56,19 @@ class Workspace:
         return text
 
     def write_file(self, path: str, content: str) -> str:
-        p = self.resolve(path)
+        p = self.resolve(path, write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} characters to {self.rel(p)}."
 
     def tools(self, read_only: bool = False) -> list[Tool]:
         tools = [
-            Tool("list_files", "List files in a workspace directory. Downloads from the browser land in 'downloads/'.",
-                 {"path": {"type": "string", "description": "Directory relative to the workspace root. Default '.'"}},
+            Tool("list_files", "List a directory. Relative paths are inside your workspace (browser downloads "
+                 "land in 'downloads/'); an absolute path or ~ reaches anywhere on this computer.",
+                 {"path": {"type": "string", "description": "Directory. Default '.', the workspace root."}},
                  self.list_files, idempotent=True),
-            Tool("read_file", "Read a workspace file as text. PDFs are converted to text.",
+            Tool("read_file", "Read a file as text (PDFs are converted to text). Relative paths are inside the "
+                 "workspace; absolute paths read from anywhere on this computer.",
                  {"path": {"type": "string"}}, self.read_file, required=("path",), idempotent=True),
         ]
         if not read_only:

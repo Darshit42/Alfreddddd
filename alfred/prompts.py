@@ -79,8 +79,9 @@ result. Overall is `pass` only if every criterion passes, `fail` if any fails, o
 
 def worker_brief(task: str, today: str, handbook: str, lessons: dict[str, str], earlier: str = "") -> str:
     parts = [f"<task>\n{task}\n</task>",
-             f"<context>\nToday's date is {today}.\nFile tools work inside your workspace directory. "
-             "Files downloaded by the browser are saved to downloads/ in the workspace.\n</context>"]
+             f"<context>\nToday's date is {today}.\nRelative file paths are inside your workspace directory, and "
+             "files downloaded by the browser are saved to downloads/ there. You can also read files anywhere on "
+             "this computer by absolute path; you can only write inside the workspace.\n</context>"]
     if handbook.strip():
         parts.append(f"<company_handbook>\n{handbook.strip()}\n</company_handbook>")
     if lessons:

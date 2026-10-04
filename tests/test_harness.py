@@ -214,12 +214,17 @@ def test_loop_turns_failures_into_observations_and_stops_when_stuck(tmp_path):
     assert "same call three times" in "\n".join(str(m["content"]) for m in messages)
 
 
-def test_workspace_confines_paths(tmp_path):
+def test_files_read_anywhere_but_write_only_in_workspace(tmp_path):
     ws = Workspace(tmp_path / "ws")
     ws.write_file("out/report.csv", "a,b\n")
     assert "out/report.csv" in ws.list_files("out")
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_text("hello", encoding="utf-8")
+    assert ws.read_file(str(outside)) == "hello" and ws.read_file("../elsewhere.txt") == "hello"
+    assert "elsewhere.txt" in ws.list_files(str(tmp_path))
     with pytest.raises(ToolError, match="outside the workspace"):
-        ws.read_file("../secret.txt")
+        ws.write_file(str(outside), "overwritten")
+    assert outside.read_text(encoding="utf-8") == "hello"
 
 
 # --------------------------------------------------------------------------- supervisor, queue, decision log
