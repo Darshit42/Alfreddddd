@@ -15,7 +15,7 @@ from pathlib import Path
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
-from ..policy import Approver, needs_approval
+from ..policy import Enforcer
 from .base import Tool, ToolError, ToolResult
 
 MAX_SNAPSHOT_CHARS = 12_000
@@ -125,8 +125,8 @@ class BrowserSession:
         raise RuntimeError("No usable browser. Run 'python -m playwright install chromium', or install Chrome "
                            f"or Edge. ({str(error).splitlines()[0]})")
 
-    def open(self, name: str, read_only: bool = False, approver: Approver | None = None) -> "Browser":
-        return Browser(self, name, read_only, approver)
+    def open(self, name: str, read_only: bool = False, enforcer: Enforcer | None = None) -> "Browser":
+        return Browser(self, name, read_only, enforcer)
 
     def next_shot_path(self, name: str) -> Path:
         self._shot_count += 1
@@ -141,20 +141,20 @@ class BrowserSession:
 
 
 class Browser:
-    def __init__(self, session: BrowserSession, name: str, read_only: bool, approver: Approver | None):
+    def __init__(self, session: BrowserSession, name: str, read_only: bool, enforcer: Enforcer | None):
         self.session = session
         self.name = name
         self.read_only = read_only
-        self.approver = approver
+        self.enforcer = enforcer
+        self._clicked = ""   # label of the control being clicked, as context for the enforcer
         self.page = session.context.new_page()
         self._status: int | None = None
         self._downloads: list = []
         self._blocked: list[str] = []
         self.page.on("response", self._on_response)
         self.page.on("download", self._on_download)
-        if read_only:
-            # Enforced at the network layer: a read-only browser cannot send anything but GET.
-            self.page.route("**/*", self._guard)
+        # Every request goes through the guard: enforcement happens on what is actually sent.
+        self.page.route("**/*", self._guard)
 
     # ------------------------------------------------------------------ internals
     def _on_response(self, response) -> None:
@@ -169,11 +169,17 @@ class Browser:
         self._downloads.append(download)
 
     def _guard(self, route) -> None:
-        if route.request.method in ("GET", "HEAD"):
-            route.continue_()
-        else:
-            self._blocked.append(f"{route.request.method} {route.request.url}")
-            route.abort()
+        req = route.request
+        if self.read_only and req.method not in ("GET", "HEAD"):
+            self._blocked.append(f"Blocked: this browser is read-only and the action tried to send "
+                                 f"{req.method} {req.url}.")
+            return route.abort()
+        if self.enforcer:
+            allowed, reason = self.enforcer.check(req.method, req.url, self._clicked, self.page.url)
+            if not allowed:
+                self._blocked.append(reason)
+                return route.abort()
+        route.continue_()
 
     def _settle(self) -> None:
         try:
@@ -230,9 +236,12 @@ class Browser:
         if not re.match(r"https?://", url):
             raise ToolError("url must start with http:// or https://")
         self._status = None
+        self._blocked.clear()
         try:
             self.page.goto(url, wait_until="domcontentloaded")
         except PlaywrightError as e:
+            if self._blocked:
+                raise ToolError(self._blocked[0]) from None
             if "Download is starting" not in str(e):
                 raise
             return ToolResult(self._collect_downloads() or "The URL started a download but no file arrived.")
@@ -246,17 +255,16 @@ class Browser:
         loc = self._locate(ref)
         label = loc.evaluate("el => (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 80)")
         what = f'{ref} "{label}"'
-        if self.approver and needs_approval(label):
-            if not self.approver(f'Click "{label}"', self.page.url):
-                raise ToolError(f'Not done: clicking "{label}" needs human approval and it was not given. '
-                                "Do not look for another way to do the same thing. If the task depends on it, "
-                                "finish with status needs_user and explain.")
         self._blocked.clear()
         self._status = None
-        loc.click()
-        self._settle()
+        self._clicked = label
+        try:
+            loc.click()
+            self._settle()
+        finally:
+            self._clicked = ""
         if self._blocked:
-            raise ToolError(f"Blocked: this browser is read-only and the click tried to send {self._blocked[0]}.")
+            raise ToolError(self._blocked[0])
         downloads = self._collect_downloads()
         return self._observe(f"Clicked {what}." + (f"\n{downloads}" if downloads else ""))
 

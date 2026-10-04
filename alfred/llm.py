@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 import anthropic
 
 DEFAULT_MODEL = "claude-opus-5-5"
+# USD per million tokens: (input, output, cache read, cache write). Used for the run's cost cap and metrics.
+PRICES = {"claude-opus-5-5": (4.0, 20.0, 0.20, 5.0), "claude-sonnet-5-5": (2.0, 10.0, 0.20, 2.5),
+          "claude-haiku-4-5": (1.0, 5.0, 0.10, 1.25)}
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 
@@ -30,6 +33,12 @@ class Usage:
         self.cache_read_tokens += getattr(u, "cache_read_input_tokens", 0) or 0
         self.cache_write_tokens += getattr(u, "cache_creation_input_tokens", 0) or 0
 
+    def cost(self, model: str) -> float:
+        """Estimated spend in USD (0 for a model with no listed price)."""
+        i, o, r, w = PRICES.get(model, (0, 0, 0, 0))
+        return (self.input_tokens * i + self.output_tokens * o + self.cache_read_tokens * r
+                + self.cache_write_tokens * w) / 1_000_000
+
 
 @dataclass
 class ClaudeLLM:
@@ -44,6 +53,9 @@ class ClaudeLLM:
     def __post_init__(self) -> None:
         # Reads ANTHROPIC_API_KEY. The SDK already retries 429 / 5xx / connection errors with backoff.
         self.client = anthropic.Anthropic(max_retries=4)
+
+    def cost(self) -> float:
+        return self.usage.cost(self.model)
 
     def complete(self, system: str, messages: list, tools: list):
         kwargs: dict = dict(

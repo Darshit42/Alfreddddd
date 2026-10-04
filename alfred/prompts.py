@@ -34,8 +34,9 @@ Asking and approval
 - Use `ask_user` when a wrong guess would be costly and the answer is not discoverable: for example, the request \
 matches more than one thing and you cannot tell which is meant. Look first; ask only what looking cannot answer. \
 For small ambiguities, pick the sensible reading and record it as an assumption.
-- Some consequential actions are held by the system until a human approves them. If approval is declined or \
-unavailable, do not look for another way to achieve the same effect.
+- Every change you send is checked by an enforcer outside your control. Consequential actions are held until a \
+human approves them, and some systems are off limits entirely. Treat a refusal as final: do not look for another \
+way to achieve the same effect.
 - Do only what the task calls for. Do not tidy up, pay, delete or change anything the colleague did not ask about, \
 even if it looks like it needs attention; mention it in your report instead.
 
@@ -76,7 +77,7 @@ result. Overall is `pass` only if every criterion passes, `fail` if any fails, o
 """
 
 
-def worker_brief(task: str, today: str, handbook: str, lessons: dict[str, str]) -> str:
+def worker_brief(task: str, today: str, handbook: str, lessons: dict[str, str], earlier: str = "") -> str:
     parts = [f"<task>\n{task}\n</task>",
              f"<context>\nToday's date is {today}.\nFile tools work inside your workspace directory. "
              "Files downloaded by the browser are saved to downloads/ in the workspace.\n</context>"]
@@ -86,6 +87,8 @@ def worker_brief(task: str, today: str, handbook: str, lessons: dict[str, str]) 
         notes = "\n".join(f"- {k}: {v}" for k, v in lessons.items())
         parts.append("<lessons_from_previous_runs>\nNotes you saved on earlier tasks. They may be out of date; "
                      f"trust what you observe over what is written here.\n{notes}\n</lessons_from_previous_runs>")
+    if earlier:
+        parts.append(earlier)
     return "\n\n".join(parts)
 
 

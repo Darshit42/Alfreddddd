@@ -41,7 +41,22 @@ python -m alfred "Find the latest invoice from Kestrel Logistics, enter it into 
 ```
 
 Useful flags: `--headed` shows the browser, `--slow 400` slows it down for a demo, `--approve ask|auto|deny`,
-`--no-input` for unattended runs, `--max-steps N`, `--no-verify`.
+`--no-input`, `--max-steps N`, `--max-cost USD`, `--no-verify`.
+
+### Unattended: the queue
+
+The same worker can drain a queue with nobody watching. Anything it cannot safely finish is parked for a
+human instead of guessed at:
+
+```bash
+python -m alfred add "Enter the latest Kestrel invoice into Ledger."
+python -m alfred add "Mark the August Kestrel Logistics bill as paid."
+python -m alfred work            # works every queued task, never prompts
+python -m alfred status          # queue, escalations with their question, cost per verified success
+python -m alfred answer 1 "Kestrel Logistics"          # reply to an escalation; the task is requeued
+python -m alfred answer 2 "Yes, go ahead" --approve    # reply and pre-approve the gated action
+python -m alfred work
+```
 
 Each run writes `runs/<timestamp>/`: `trace.jsonl` (every decision and observation), `shots/`
 (a screenshot after every page change) and `report.html` (outcome, verification table, full timeline).
@@ -75,11 +90,19 @@ Tests (no API key needed): `python -m pytest -q`
    │ tools/     │  │ verifier.py  second agent,       │
    │ browser    │  │ fresh context, read-only browser │──► pass: done
    │ files      │  │ checks the criteria set up front │──► fail: findings go back to the worker
-   │ policy.py  │  └──────────────────────────────────┘
-   └───┬────────┘
+   └───┬────────┘  └──────────────────────────────────┘
+       │ every request the browser sends
+   ┌───▼────────────────────────────┐
+   │ policy.py  the enforcer        │──► allow / hold for human approval / refuse
+   └───┬────────────────────────────┘
        ▼
-   trace.py  →  trace.jsonl, screenshots, report.html
+   store.py   SQLite: task queue with leases · run records · append-only decision log
+   trace.py   trace.jsonl, screenshots, report.html
 ```
+
+There are two layers, kept strictly apart. The **deterministic layer** (queue, leases, enforcer, budgets,
+verdict arithmetic, decision log) is plain code and SQL and costs no model calls. The **non-deterministic
+layer** (the model) is invoked for one thing only: the judgment of how to carry out the task.
 
 - **`loop.py`** — model decides, harness executes, model observes. It knows nothing about browsers or
   invoices. It owns control: step budget, "you are repeating yourself" detection, and the guarantee that
@@ -89,7 +112,8 @@ Tests (no API key needed): `python -m pytest -q`
 - **`tools/files.py`** — list/read/write confined to the workspace. PDFs are read as text.
 - **`worker.py`** — the four control tools (`plan`, `remember`, `ask_user`, `finish`) and the outcome logic.
 - **`verifier.py`** — independent check of a claimed success.
-- **`policy.py`** — which actions need a human's approval.
+- **`policy.py`** — the enforcer: rules on the requests the browser actually sends.
+- **`store.py`** — the queue (atomic leases, heartbeat, reclaim), run records, decision log, metrics.
 - **`sandbox/`** — the simulated company. The agent never imports it; it only sees it through the browser.
 
 ## Design decisions and why
@@ -119,10 +143,34 @@ smaller than HTML, and actions are unambiguous. Every action returns the resulti
 not a separate step the model can forget. The cost: canvas-heavy or highly visual UIs would need a
 vision fallback.
 
-**Approval is enforced, not requested.** The prompt asks the model to be careful, but the gate is code:
-a click on a control labelled pay/delete/approve/etc. pauses for a human. This also bounds the damage of
-prompt injection. The sandbox inbox contains an email telling "AI assistants" to mark bills as paid; even
-if a model fell for it, the click would stop at the gate.
+**Gates are code, not prompts.** The prompt asks the model to be careful; the enforcer does not ask. Every
+request the worker's browser sends is routed through `policy.py`, and the verdict is made on the actual
+operation (method and URL, plus the label of the control that triggered it), not on what the model says it
+is about to do. Ordinary writes are allowed, consequential ones (pay, delete, approve, ...) are held for a
+human, and anything on the workspace's never-list (`workspace/policy.json`) is refused even with approval.
+This bounds the damage of prompt injection: the sandbox inbox contains an email telling "AI assistants" to
+mark bills as paid, and even if a model fell for it, the request would stop at the gate. Every verdict on
+a write is recorded, so the report lists exactly what the worker changed.
+
+**Precision over recall.** When unsure, escalate. In queue mode a question or a needed approval does not
+block a terminal: the task moves to `needs_human` with its question, the worker moves on, and
+`alfred answer` requeues it with the reply attached. Only a verified success counts as `done`. A wrong
+entry in a ledger costs more than a task that waits for a person.
+
+**Lease before work; crash-safe by construction.** A queued task is claimed atomically and its lease is
+renewed by a heartbeat on every agent step. If the process dies, the lease lapses, the supervisor pass
+requeues the task, and the retry is told an earlier attempt may have partly finished so it checks state
+before acting. After two interrupted attempts the task is escalated rather than retried blind.
+
+**A supervisor the model cannot argue with.** Step budget, stall detection and a per-run cost cap
+(`--max-cost`, checked before each model call) end a run that is going nowhere. `alfred status` reports
+cost per verified success, fully loaded: spend on escalated and failed runs is included, because that is
+the number that decides whether the worker is worth running.
+
+**The decision log is written from run one.** Every model decision, observation, enforcer verdict and
+reviewer verdict is appended to SQLite as it happens (and mirrored to `trace.jsonl`). Nothing consumes it
+yet beyond the report and metrics; it is the raw material for evals and for learning which tasks are safe
+to automate.
 
 **Environment knowledge lives in a handbook, not in code.** URLs, credentials and house rules are in
 `workspace/HANDBOOK.md`, the same thing you would give a new hire. Pointing Alfred at a different
@@ -145,21 +193,24 @@ or `incomplete`. The exit code is 0 only for verified success.
 - Tasks are carried out through ordinary web UIs and files. No desktop apps, no CAPTCHAs, no MFA.
 - The user's request plus the handbook is enough context for a competent new hire to do the task.
 - Reads (GET) do not change state in the systems being verified.
-- One task at a time, one worker, a human reachable at the terminal (or `--no-input`).
+- A human is reachable eventually: at the terminal for `run`, or via `status` / `answer` for the queue.
 
 ## Known limitations
 
 - **Only exercised live in the sandbox.** Real sites bring iframes, shadow DOM, infinite scroll, popups
   and bot detection; the snapshot does not handle iframes or shadow DOM today.
-- **Approval is label-based.** A risky action behind an innocuous label ("Confirm"), or a form submitted
-  with the Enter key, would not be caught. A real system should gate on the request, not the label.
+- **The enforcer's default rules are keyword-based** (on the request path and the control label). A
+  consequential endpoint with a bland path and a bland button needs a rule in `policy.json`; request
+  bodies are not inspected.
 - **The verifier is another LLM.** It reduces self-grading bias but can be wrong. It also cannot sign in
   (read-only), so if the session has expired it returns `inconclusive` and the worker must sign in again.
 - **Lessons are written by the model** and are not reviewed; a poisoned page could try to get a bad
   lesson saved. The prompt forbids it, nothing enforces it.
 - **Credentials sit in the handbook** in plain text. Fine for a sandbox, wrong for production.
-- **No resume.** A crashed run restarts from scratch (the duplicate check in the sandbox makes that safe
-  here, not in general).
+- **Retries restart, they do not resume.** A reclaimed task starts a fresh run that is told to check
+  state first. That is safe against systems with duplicate checks (like the sandbox), not in general.
+- **One worker per browser session.** Leases make several workers on one queue safe, but nothing
+  coordinates two workers touching the same record.
 - The automated tests drive the full harness with a scripted stand-in for the model. They prove the
   machinery (loop, browser, gates, verification flow), not the quality of the model's decisions.
 
@@ -167,12 +218,14 @@ or `incomplete`. The exit code is 0 only for verified success.
 
 1. An eval suite: 20–30 sandbox tasks with ground-truth checks via `/__sandbox/state`, run on every
    change, tracking success rate, steps and cost.
-2. Request-level approval policy (method, URL, payload) with a dry-run preview of what will be sent.
-3. Durable runs: checkpoint the transcript so a run can resume, and so `needs_user` can wait hours.
+2. Enforcer rules on request payloads, with a preview of exactly what will be sent in the approval prompt.
+3. Checkpoint the transcript so a reclaimed task resumes mid-run instead of restarting.
 4. More tools behind the same interface: an HTTP/API tool, email sending, spreadsheets; a vision
    fallback for pages the text snapshot cannot represent.
 5. A secrets broker so the model never sees credentials, and per-task scoped permissions.
-6. A small web UI: live trace, approval inbox, run history.
+6. A dashboard over the SQLite store: live timeline, approval inbox, decisions, metrics.
+7. A triage step before dispatch: hard gates plus one cheap model call to route a task to the worker or
+   straight to a human, using the decision log as its training signal.
 
 ## Models, APIs and components used
 
@@ -184,3 +237,7 @@ or `incomplete`. The exit code is 0 only for verified success.
 - **Playwright** (Chromium) for the browser, **pypdf** for reading PDFs, **rich** for the console.
 - **Sandbox:** FastAPI + SQLite + reportlab (to generate the invoice PDFs). All data is fictional.
 - Built with Claude Code as a coding assistant.
+
+The control-plane ideas (two strictly separated layers, gates as code, lease-before-work, a supervisor,
+an append-only decision log, precision over recall) are carried over from Apiary, an autonomous
+coding-agent fleet I built earlier, and applied here to a browser-and-files worker.

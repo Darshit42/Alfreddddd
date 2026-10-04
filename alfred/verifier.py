@@ -40,8 +40,8 @@ def _submit_verdict(checks: list, overall: str, feedback: str = "") -> ToolResul
 
 
 def verify(*, llm, task: str, today: str, handbook: str, plan: dict, claim: dict, session: BrowserSession,
-           workspace: Workspace, trace: Trace, max_steps: int = 20) -> dict:
-    browser = session.open("verifier", read_only=True)
+           workspace: Workspace, trace: Trace, enforcer=None, supervise=None, max_steps: int = 20) -> dict:
+    browser = session.open("verifier", read_only=True, enforcer=enforcer)
     try:
         tools = Toolset(browser.tools() + workspace.tools(read_only=True) + [Tool(
             "submit_verdict", "Record your verdict and end the review.",
@@ -55,7 +55,7 @@ def verify(*, llm, task: str, today: str, handbook: str, plan: dict, claim: dict
             _submit_verdict, required=("checks", "overall"))])
         messages = [{"role": "user", "content": verifier_brief(task, today, handbook, plan, claim)}]
         end = run_loop(llm=llm, system=VERIFIER_SYSTEM, messages=messages, tools=tools, trace=trace,
-                       role="verifier", max_steps=max_steps)
+                       role="verifier", max_steps=max_steps, supervise=supervise)
     finally:
         browser.page.close()
     if end.reason == "final":

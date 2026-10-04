@@ -5,7 +5,8 @@ import pytest
 from rich.console import Console
 
 from alfred.loop import run_loop
-from alfred.policy import always_deny, needs_approval
+from alfred.policy import Enforcer, always_deny, auto_approve
+from alfred.store import Store, prior_attempts_note
 from alfred.tools import Tool, ToolError, ToolResult, Toolset
 from alfred.tools.browser import BrowserSession
 from alfred.tools.files import Workspace
@@ -135,21 +136,36 @@ def login(browser, url):
     return browser.click(ref(obs, "button", "Sign in")).text
 
 
-def test_risky_click_needs_approval(sandbox, session):
-    asked = []
-    browser = session.open("w", approver=lambda action, url: asked.append(action) or False)
-    login(browser, sandbox.url)
+def test_enforcer_gates_the_actual_request(sandbox, session):
+    asked, log = [], []
+    enforcer = Enforcer(lambda action, url: asked.append(action) or False, never=["^/__sandbox/"],
+                        log=lambda **kw: log.append((kw["method"], kw["verdict"])))
+    browser = session.open("w", enforcer=enforcer)
+    login(browser, sandbox.url)                                   # an ordinary write: allowed, and logged
     obs = browser.navigate(f"{sandbox.url}/ledger/bills/2").text
     with pytest.raises(ToolError, match="needs human approval"):
         browser.click(ref(obs, "button", "Mark as paid"))
-    assert asked == ['Click "Mark as paid"']
+    assert asked == ['POST /ledger/bills/2/pay (after clicking "Mark as paid")']
+    with pytest.raises(ToolError, match="off limits"):            # never-list: not even readable
+        browser.navigate(f"{sandbox.url}/__sandbox/state")
+    assert log == [("POST", "allowed"), ("POST", "denied"), ("GET", "refused")]
     bills = httpx.get(f"{sandbox.url}/__sandbox/state").json()["bills"]
     assert next(b for b in bills if b["id"] == 2)["status"] == "unpaid"
-    assert needs_approval("Delete bill") and not needs_approval("Save bill") and not needs_approval("Sign in")
+
+
+def test_enforcer_judges_the_operation_not_the_label():
+    e = Enforcer(always_deny)
+    assert e.check("POST", "http://x/ledger/bills/new", "Save bill")[0]
+    assert e.check("POST", "http://x/ledger/login", "Sign in")[0]
+    assert not e.check("POST", "http://x/ledger/bills/2/delete", "Confirm")[0]    # innocuous label, risky request
+    assert not e.check("POST", "http://x/form", "Delete bill")[0]                 # risky label, innocuous URL
+    assert e.check("GET", "http://x/ledger/bills/2/delete")[0]                    # reads are not writes
+    assert Enforcer(auto_approve).check("POST", "http://x/ledger/bills/2/pay")[0]
+    assert not Enforcer(auto_approve, never=["^/admin"]).check("POST", "http://x/admin/x")[0]   # approval cannot override
 
 
 def test_read_only_browser_cannot_change_anything(sandbox, session):
-    login(session.open("w", approver=always_deny), sandbox.url)
+    login(session.open("w", enforcer=Enforcer(always_deny)), sandbox.url)
     reviewer = session.open("v", read_only=True)       # shares the signed-in cookie jar
     obs = reviewer.navigate(f"{sandbox.url}/ledger/bills/2").text
     assert "Bill #2" in obs
@@ -190,3 +206,61 @@ def test_workspace_confines_paths(tmp_path):
     assert "out/report.csv" in ws.list_files("out")
     with pytest.raises(ToolError, match="outside the workspace"):
         ws.read_file("../secret.txt")
+
+
+# --------------------------------------------------------------------------- supervisor, queue, decision log
+def test_cost_cap_stops_the_run(tmp_path):
+    llm = ScriptedLLM([[call("plan", goal="g", success_criteria=["c"])]] * 5)
+    llm.cost = lambda: 0.50 * llm.usage.calls
+    trace = quiet_trace(tmp_path)
+    cfg = RunConfig(workspace=tmp_path / "ws", run_dir=trace.run_dir, max_cost_usd=1.0)
+    outcome = run_task("t", llm, cfg, trace)
+    assert outcome["status"] == "incomplete" and "cost cap" in outcome["summary"]
+    assert llm.usage.calls == 3     # stopped before the fourth call, not after the money was spent
+
+
+def test_queue_leases_are_exclusive_and_crash_safe(tmp_path):
+    a, b = Store(tmp_path / "q.db"), Store(tmp_path / "q.db")
+    b.owner = "worker-b"
+    tid = a.add("do the thing")
+    assert a.lease_next()["id"] == tid
+    assert b.lease_next() is None                         # one task, one owner
+
+    # The worker dies: its lease lapses and the supervisor requeues the task for another attempt.
+    a.db.execute("UPDATE tasks SET lease_expires = datetime('now', '-1 second')")
+    assert b.reclaim_expired() == [tid]
+    row = b.lease_next()
+    assert row["id"] == tid and "interrupted" in prior_attempts_note(row["history"], row["attempts"] + 1)
+
+    # It dies again: no third blind retry, a person gets it instead.
+    b.db.execute("UPDATE tasks SET lease_expires = datetime('now', '-1 second')")
+    b.reclaim_expired()
+    assert b.tasks()[0]["state"] == "needs_human" and b.lease_next() is None
+
+
+def test_escalated_task_waits_for_a_human_then_resumes(tmp_path):
+    store = Store(tmp_path / "q.db")
+    tid = store.add("enter the latest Kestrel invoice")
+    store.lease_next()
+    assert store.complete(tid, {"status": "needs_user", "summary": "Which Kestrel: Logistics or Labs?"}) == "needs_human"
+    assert store.lease_next() is None                     # parked, not retried
+    assert store.answer(tid, "Logistics") and not store.answer(999, "x")
+    row = store.lease_next()
+    note = prior_attempts_note(row["history"], row["attempts"] + 1)
+    assert "Which Kestrel" in note and "Your colleague replied: Logistics" in note
+    assert store.complete(tid, {"status": "success", "summary": "done"}) == "done"
+
+
+def test_decision_log_and_metrics(tmp_path):
+    store = Store(tmp_path / "q.db")
+    trace = Trace(tmp_path / "run-1", Console(quiet=True), sink=store.log)
+    store.start_run("run-1", "t")
+    trace.event("write", role="worker", method="POST", url="http://x/pay", label="Pay", verdict="denied")
+    store.end_run("run-1", {"status": "success", "verified": True, "steps": 4, "cost_usd": 0.4})
+    store.start_run("run-2", "t")
+    store.end_run("run-2", {"status": "needs_user", "steps": 2, "cost_usd": 0.2})
+    kinds = [r["kind"] for r in store.db.execute("SELECT kind FROM decisions WHERE run_id = 'run-1'")]
+    assert kinds == ["write"]
+    m = store.metrics()
+    assert (m["runs"], m["verified"], m["escalated"]) == (2, 1, 1)
+    assert round(m["cost_per_verified"], 2) == 0.60       # fully loaded: escalated spend counts too

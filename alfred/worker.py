@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from .loop import run_loop
-from .policy import Approver, always_deny
+from .policy import Approver, Enforcer, always_deny
 from .prompts import WORKER_SYSTEM, worker_brief
 from .tools import Tool, ToolError, ToolResult, Toolset
 from .tools.browser import BrowserSession
@@ -33,6 +33,9 @@ class RunConfig:
     max_steps: int = 40
     verify: bool = True
     max_verify_rounds: int = 2   # how many times a rejected "success" may be reworked
+    max_cost_usd: float = 3.0    # supervisor cap: the run is stopped when estimated spend passes this
+    earlier_attempts: str = ""   # context for a retried or answered task (from the queue)
+    heartbeat: Callable[[], None] = field(default=lambda: None)   # keeps the task lease alive
     approver: Approver = always_deny
     asker: Asker = field(default=lambda q, o: None)
 
@@ -55,7 +58,17 @@ def run_task(task: str, llm, cfg: RunConfig, trace: Trace) -> dict:
     workspace = Workspace(cfg.workspace)
     lessons = Lessons(cfg.workspace / ".alfred" / "lessons.json")
     session = BrowserSession(workspace.root / "downloads", cfg.run_dir / "shots", cfg.headed, cfg.slow_mo)
-    browser = session.open("worker", approver=cfg.approver)
+    enforcer = Enforcer.from_workspace(workspace.root, cfg.approver,
+                                       log=lambda **kw: trace.event("write", role="worker", **kw))
+    browser = session.open("worker", enforcer=enforcer)
+
+    def supervise() -> str | None:
+        cfg.heartbeat()
+        spent = llm.cost() if hasattr(llm, "cost") else 0.0
+        if spent > cfg.max_cost_usd:
+            trace.event("harness", note=f"Cost cap reached (${spent:.2f} > ${cfg.max_cost_usd:.2f}): stopping the run.")
+            return "budget"
+        return None
 
     state: dict = {"plan": None, "facts": {}, "verdict": None, "rejections": 0}
     trace.event("task", task=task)
@@ -94,7 +107,8 @@ def run_task(task: str, llm, cfg: RunConfig, trace: Trace) -> dict:
         if state["plan"] is None:
             raise ToolError("Record a plan with success criteria first: they are what the reviewer checks.")
         verdict = verify(llm=llm, task=task, today=today, handbook=cfg.handbook, plan=state["plan"], claim=claim,
-                         session=session, workspace=workspace, trace=trace)
+                         session=session, workspace=workspace, trace=trace, enforcer=enforcer,
+                         supervise=supervise)
         state["verdict"] = verdict
         if verdict["overall"] == "pass":
             return ToolResult("Verified.", final=True, data=claim | {"verified": True})
@@ -135,11 +149,12 @@ def run_task(task: str, llm, cfg: RunConfig, trace: Trace) -> dict:
              finish, required=("status", "summary")),
     ]
     tools = Toolset(browser.tools() + workspace.tools() + control)
-    messages = [{"role": "user", "content": worker_brief(task, today, cfg.handbook, lessons.items)}]
+    messages = [{"role": "user", "content": worker_brief(task, today, cfg.handbook, lessons.items,
+                                                            cfg.earlier_attempts)}]
 
     try:
         end = run_loop(llm=llm, system=WORKER_SYSTEM, messages=messages, tools=tools, trace=trace,
-                       role="worker", max_steps=cfg.max_steps)
+                       role="worker", max_steps=cfg.max_steps, supervise=supervise)
     finally:
         session.close()
 
@@ -150,8 +165,10 @@ def run_task(task: str, llm, cfg: RunConfig, trace: Trace) -> dict:
     else:
         reasons = {"max_steps": f"Stopped after the budget of {cfg.max_steps} steps without finishing.",
                    "stalled": "Stopped because the agent stopped making progress.",
-                   "refusal": "The model declined to continue with this task."}
+                   "refusal": "The model declined to continue with this task.",
+                   "budget": f"Stopped by the supervisor: the cost cap of ${cfg.max_cost_usd:.2f} was reached."}
         outcome = {"status": "incomplete", "summary": reasons[end.reason], "details": [], "verified": None}
     outcome.update(plan=state["plan"], facts=state["facts"], verdict=state["verdict"], steps=end.steps,
-                   usage=vars(llm.usage) if hasattr(llm, "usage") else {})
+                   usage=vars(llm.usage) if hasattr(llm, "usage") else {},
+                   cost_usd=round(llm.cost(), 4) if hasattr(llm, "cost") else 0.0)
     return outcome

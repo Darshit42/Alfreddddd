@@ -1,0 +1,4 @@
+{
+  "never": ["^/__sandbox/"],
+  "approve": []
+}

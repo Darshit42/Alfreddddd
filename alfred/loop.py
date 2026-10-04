@@ -14,6 +14,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from .tools import ToolResult, Toolset
 from .trace import Trace
@@ -28,17 +29,21 @@ BUDGET_NUDGE = ("[harness] Only {n} steps remain in this run's budget. Wrap up n
 
 @dataclass
 class LoopEnd:
-    reason: str                 # final | max_steps | stalled | refusal
+    reason: str                 # final | max_steps | stalled | refusal | budget
     result: ToolResult | None
     steps: int
 
 
 def run_loop(*, llm, system: str, messages: list, tools: Toolset, trace: Trace, role: str,
-             max_steps: int) -> LoopEnd:
+             max_steps: int, supervise: Callable[[], "str | None"] | None = None) -> LoopEnd:
+    """supervise() runs before every model call: it is the heartbeat, and may return a reason to stop."""
     idle_turns = 0
     last_call, streak = None, 0
 
     for step in range(1, max_steps + 1):
+        stop = supervise() if supervise else None
+        if stop:
+            return LoopEnd(stop, None, step - 1)
         response = llm.complete(system, messages, tools.schemas())
         blocks = list(response.content or [])
         trace.event(

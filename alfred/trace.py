@@ -24,7 +24,8 @@ def _short(text: str, limit: int) -> str:
 
 
 class Trace:
-    def __init__(self, run_dir: Path, console: Console | None = None):
+    def __init__(self, run_dir: Path, console: Console | None = None, sink=None):
+        self.sink = sink  # durable decision log (Store.log), if any
         self.run_dir = run_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         self.events: list[dict] = []
@@ -37,6 +38,8 @@ class Trace:
         self.events.append(ev)
         self._file.write(json.dumps(ev, ensure_ascii=False, default=str) + "\n")
         self._file.flush()
+        if self.sink:
+            self.sink(self.run_dir.name, ev)
         self._render(ev)
         return ev
 
@@ -69,6 +72,8 @@ class Trace:
             c.print(Panel("\n".join(lines), title="Plan", border_style="blue"))
         elif k == "harness":
             c.print(f"  [yellow]harness:[/] {escape(ev['note'])}")
+        elif k == "write" and ev["verdict"] != "allowed":
+            c.print(f"  [yellow]enforcer:[/] {ev['method']} {escape(ev['url'])} -> [bold]{ev['verdict']}[/]")
         elif k == "verdict":
             colour = {"pass": "green", "fail": "red"}
             style = colour.get(ev["overall"], "yellow")
@@ -83,7 +88,7 @@ class Trace:
     # ------------------------------------------------------------------ report
     def write_report(self, task: str, outcome: dict) -> Path:
         esc = html.escape
-        rows = []
+        rows, writes = [], []
         for ev in self.events:
             k = ev["kind"]
             who = ev.get("role", "worker")
@@ -107,6 +112,9 @@ class Trace:
                     f'<pre>{esc(ev["result"])}</pre>{shot}</details></div>')
             elif k == "harness":
                 rows.append(f'<div class="ev harness"><span class="t">{ev["t"]}s · harness</span>{esc(ev["note"])}</div>')
+            elif k == "write":
+                writes.append(f'<tr><td class="{ev["verdict"]}">{ev["verdict"]}</td><td>{ev["method"]}</td>'
+                              f'<td>{esc(ev["url"])}</td><td>{esc(ev.get("label") or "")}</td></tr>')
             elif k == "verdict":
                 checks = "".join(f'<tr><td class="{c["result"]}">{c["result"]}</td><td>{esc(c["criterion"])}</td>'
                                  f'<td>{esc(c["observed"])}</td></tr>' for c in ev["checks"])
@@ -125,7 +133,7 @@ h1{{font-size:20px}} .status{{display:inline-block;padding:3px 10px;border-radiu
 .think{{color:#667;font-style:italic;white-space:pre-wrap}} pre{{white-space:pre-wrap;background:#f5f6f8;padding:8px;max-height:320px;overflow:auto}}
 img{{max-width:100%;border:1px solid #ccd;margin-top:6px}} .err{{color:#b3261e}} .okk{{color:#1b6e3c}}
 td{{padding:4px 8px;border-bottom:1px solid #e3e6eb;vertical-align:top}} td.pass{{color:#1b6e3c;font-weight:600}}
-td.fail{{color:#b3261e;font-weight:600}} td.unknown{{color:#9a6b00;font-weight:600}} code{{word-break:break-all}}
+td.fail,td.denied,td.refused{{color:#b3261e;font-weight:600}} td.unknown,td.approved{{color:#9a6b00;font-weight:600}} code{{word-break:break-all}}
 </style></head><body>
 <h1>Alfred run report</h1><p class="t">{esc(datetime.now().strftime("%Y-%m-%d %H:%M"))} · {esc(self.run_dir.name)}</p>
 <h2>Task</h2><p>{esc(task)}</p>
@@ -133,7 +141,9 @@ td.fail{{color:#b3261e;font-weight:600}} td.unknown{{color:#9a6b00;font-weight:6
 <ul>{details}</ul>
 <h2>Success criteria (set before acting)</h2><ul>{crit}</ul>
 <h2>Facts recorded</h2><ul>{facts}</ul>
-<p class="t">{u.get("calls", 0)} model calls · {u.get("input_tokens", 0)} input / {u.get("output_tokens", 0)} output tokens ·
+<h2>Every change the worker sent (enforcer log)</h2>
+<table><tr><th>Verdict</th><th>Method</th><th>URL</th><th>Triggered by</th></tr>{''.join(writes)}</table>
+<p class="t">Estimated cost ${outcome.get("cost_usd", 0):.2f} · {u.get("calls", 0)} model calls · {u.get("input_tokens", 0)} input / {u.get("output_tokens", 0)} output tokens ·
 {u.get("cache_read_tokens", 0)} cached</p>
 <h2>Timeline</h2>{''.join(rows)}</body></html>"""
         path = self.run_dir / "report.html"
