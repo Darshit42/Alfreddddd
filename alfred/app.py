@@ -11,6 +11,7 @@ and approvals that the CLI asks in the terminal appear here as dialogs.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import threading
 import time
@@ -46,6 +47,7 @@ class Session:
         self.outcome: dict | None = None
         self.report: str | None = None
         self.pending: dict | None = None     # a question or approval waiting for the human
+        self.call: dict | None = None        # phone mode: {"status": ..., "transcript": [...]}
         self._answer = None
         self._answered = threading.Event()
 
@@ -70,7 +72,33 @@ class Session:
         self._answer = value
         self._answered.set()
 
-    def run(self, task: str, headed: bool, team: bool = False) -> None:
+    def run(self, task: str, headed: bool, team: bool = False, phone: str = "") -> None:
+        """One task, or with a phone number the loop: do the task, call with the result, take the next by voice."""
+        report = ""
+        if task:
+            report = self.run_one(task, headed, team)
+        if not phone:
+            return
+        from . import voice
+        try:
+            while True:
+                self.call = {"status": f"Calling {phone} ...", "transcript": []}
+                result = voice.call_user(phone, report)
+                self.call = {"transcript": result.get("transcript", []), "status": (
+                    "Call finished: new task received" if result.get("next_task") else
+                    "Call finished: no further task" if result.get("answered") else
+                    f"Not answered ({result.get('error') or 'no answer'})")}
+                if not result.get("next_task"):
+                    return
+                self.task, self.outcome, self.report, self.trace = result["next_task"], None, None, None
+                report = self.run_one(self.task, headed, team)
+        except Exception as e:  # noqa: BLE001 - calling is optional; say why it failed and keep the app alive
+            self.call = {"status": f"Calling failed: {e}", "transcript": []}
+        finally:
+            voice.stop_worker()
+
+    def run_one(self, task: str, headed: bool, team: bool = False) -> str:
+        """Run a single task to its outcome; returns the report to speak on a call."""
         run_dir = Path("runs") / datetime.now().strftime("%Y%m%d-%H%M%S")
         store = Store(WORKSPACE / ".alfred" / "alfred.db")      # SQLite connections are per thread
         store.start_run(run_dir.name, task)
@@ -99,6 +127,8 @@ class Session:
         self.report = str(trace.write_report(task, outcome).resolve())
         trace.close()
         self.outcome = outcome
+        from .voice import spoken_report
+        return spoken_report(task, outcome)
 
 
 class Connect(BaseModel):
@@ -110,6 +140,7 @@ class Start(BaseModel):
     task: str
     headed: bool = False
     team: bool = False
+    phone: str = ""      # E.164; when set, Alfred calls with the result and takes the next task by voice
 
 
 def create_ui(session: Session) -> FastAPI:
@@ -154,8 +185,20 @@ def create_ui(session: Session) -> FastAPI:
             return JSONResponse({"error": "A task is already running."}, 409)
         if not session.config.get("provider"):
             return JSONResponse({"error": "Connect a model first."}, 400)
+        phone = body.phone.strip().replace(" ", "")
+        if phone:
+            from . import voice
+            if not re.fullmatch(r"\+\d{8,15}", phone):
+                return JSONResponse({"error": "Phone number must include the country code, e.g. +919812345678."}, 400)
+            if voice.missing_config():
+                return JSONResponse({"error": "Calling is not configured: fill in .env (see .env.example)."}, 400)
+            session.save_config(phone=phone)
+        elif not body.task.strip():
+            return JSONResponse({"error": "Type a task first."}, 400)
         session.task, session.outcome, session.report, session.trace = body.task.strip(), None, None, None
-        session.thread = threading.Thread(target=session.run, args=(session.task, body.headed, body.team), daemon=True)
+        session.call = None
+        session.thread = threading.Thread(target=session.run, args=(session.task, body.headed, body.team, phone),
+                                          daemon=True)
         session.thread.start()
         return {"ok": True}
 
@@ -193,7 +236,8 @@ def create_ui(session: Session) -> FastAPI:
         return {"provider": cfg.get("provider"), "provider_name": PROVIDERS.get(cfg.get("provider") or "", ""),
                 "model": cfg.get("model"), "models": cfg.get("models", []), "running": session.running,
                 "task": session.task, "run": session.trace.run_dir.name if session.trace else None, "events": out, "total": len(events), "shot": shot_index,
-                "pending": session.pending, "outcome": session.outcome, "report": session.report,
+                "pending": session.pending, "call": session.call, "phone": cfg.get("phone", ""),
+                "outcome": session.outcome, "report": session.report,
                 "sandbox": f"http://127.0.0.1:{SANDBOX_PORT}/"}
 
     return api
@@ -277,9 +321,13 @@ td.pass{color:var(--ok);font-weight:600}td.fail{color:var(--bad);font-weight:600
     <div class="row"><label class="small"><input type="checkbox" id="headed"> Show browser</label>
     <label class="small" title="An overseer splits the request and dispatches role-scoped sub-agents"><input type="checkbox" id="team"> Overseer + sub-agents</label><span class="sp"></span>
     <button class="primary" id="run">Run</button></div>
+    <div class="row"><input type="text" id="phone" placeholder="Your phone, e.g. +919812345678 (optional)" style="flex:1">
+    <button id="callme" title="Alfred rings you and takes the task by voice">Call me for a task</button></div>
+    <div class="small mute" style="margin-top:4px">With a number filled in, Run also calls you with the result and takes the next task by voice.</div>
     <div class="row small mute"><a id="sandbox" href="#" target="_blank">Open the demo company</a><span class="sp"></span>
     <button id="reset" class="small">Reset demo data</button></div>
     <div class="error" id="runerr"></div></div>
+  <div class="card" id="callcard" style="display:none"><h2>Phone</h2><div id="callbox"></div></div>
   <div class="card" id="plancard" style="display:none"><h2>Plan</h2><div id="plan"></div></div>
   <div class="card" id="resultcard" style="display:none"><h2>Result</h2><div id="result"></div></div>
 </div>
@@ -325,8 +373,10 @@ $("cancel").onclick = () => $("setup").style.display = "none";
 $("change").onclick = () => $("setup").style.display = "flex";
 $("model").onchange = () => post("/api/model", {model: $("model").value});
 $("reset").onclick = async () => { await post("/api/sandbox/reset"); $("reset").textContent = "Reset done"; setTimeout(() => $("reset").textContent = "Reset demo data", 1500); };
-$("run").onclick = async () => { const task = $("task").value.trim(); if (!task) return; $("runerr").textContent = "";
-  const r = await post("/api/run", {task, headed: $("headed").checked, team: $("team").checked}); if (!r.ok) $("runerr").textContent = r.data.error; };
+const start = async (task, phone) => { $("runerr").textContent = "";
+  const r = await post("/api/run", {task, phone, headed: $("headed").checked, team: $("team").checked}); if (!r.ok) $("runerr").textContent = r.data.error; };
+$("run").onclick = () => { const task = $("task").value.trim(); if (task) start(task, $("phone").value.trim()); };
+$("callme").onclick = () => { const phone = $("phone").value.trim(); if (!phone) { $("runerr").textContent = "Enter your phone number first."; return; } start("", phone); };
 
 function render(ev) {
   const who = ev.role === "verifier" || ev.role === "overseer" ? ev.role : "worker";
@@ -346,6 +396,11 @@ async function tick() {
   if (!s.provider && $("setup").style.display !== "flex") $("setup").style.display = "flex";
   const sel = $("model"); if (sel.dataset.sig !== s.models.join()) { sel.dataset.sig = s.models.join(); sel.innerHTML = s.models.map(m => `<option>${esc(m)}</option>`).join(""); }
   if (document.activeElement !== sel) sel.value = s.model || "";
+  if (!$("phone").dataset.init) { $("phone").dataset.init = "1"; $("phone").value = s.phone || ""; }
+  $("callme").disabled = s.running;
+  $("callcard").style.display = s.call ? "" : "none";
+  if (s.call) $("callbox").innerHTML = `<b>${esc(s.call.status)}</b>` + (s.call.transcript || []).map(t => `<div class="small"><span class="who">${esc(t.role)}</span> ${esc(t.text)}</div>`).join("");
+  if (s.task && document.activeElement !== $("task") && s.running) $("task").value = s.task;
   $("sandbox").href = s.sandbox; $("run").disabled = s.running; $("busy").textContent = s.running ? "· working…" : "";
   if (s.run !== runId) { runId = s.run; seen = 0; lastShot = null; $("timeline").innerHTML = "";
     $("plancard").style.display = "none"; $("resultcard").style.display = "none"; return; }
