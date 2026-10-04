@@ -33,7 +33,7 @@ class RunConfig:
     max_steps: int = 40
     verify: bool = True
     max_verify_rounds: int = 2   # how many times a rejected "success" may be reworked
-    max_cost_usd: float = 3.0    # supervisor cap: the run is stopped when estimated spend passes this
+    max_cost_usd: float = 10.0   # supervisor cap: the run is stopped when estimated spend passes this
     earlier_attempts: str = ""   # context for a retried or answered task (from the queue)
     heartbeat: Callable[[], None] = field(default=lambda: None)   # keeps the task lease alive
     approver: Approver = always_deny

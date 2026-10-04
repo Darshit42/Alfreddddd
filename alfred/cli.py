@@ -21,6 +21,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from .policy import always_deny, auto_approve
+from .providers import ENV_KEYS, PROVIDERS, detect_provider, make_llm
 from .store import Store, prior_attempts_note
 from .trace import Trace
 from .worker import RunConfig, run_task
@@ -39,8 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_opts.add_argument("--headed", action="store_true", help="show the browser window while it works")
     run_opts.add_argument("--slow", type=int, default=0, metavar="MS", help="slow each browser action down (demos)")
     run_opts.add_argument("--max-steps", type=int, default=40)
-    run_opts.add_argument("--max-cost", type=float, default=3.0, metavar="USD", help="stop a run past this spend")
+    run_opts.add_argument("--max-cost", type=float, default=10.0, metavar="USD", help="stop a run past this spend")
     run_opts.add_argument("--no-verify", action="store_true", help="skip independent verification")
+    run_opts.add_argument("--provider", choices=list(PROVIDERS), default=None,
+                          help="model provider (default: whichever credential is found; see README)")
+    run_opts.add_argument("--model", default=None, help="model name for the chosen provider")
 
     ap = argparse.ArgumentParser(prog="alfred", description="Autonomous AI task worker")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -96,9 +100,8 @@ def execute(task: str, args, store: Store, console: Console, *, task_id: int | N
         approver={"ask": ask_approval, "auto": auto_approve, "deny": always_deny}[approve],
         earlier_attempts=earlier, heartbeat=(lambda: store.heartbeat(task_id)) if task_id else (lambda: None))
 
-    from .llm import ClaudeLLM
     try:
-        outcome = run_task(task, ClaudeLLM(), cfg, trace)
+        outcome = run_task(task, make_llm(args.provider, model=args.model), cfg, trace)
     except KeyboardInterrupt:
         outcome = {"status": "incomplete", "summary": "Interrupted by the user.", "details": []}
     except Exception as e:  # noqa: BLE001 - an infrastructure failure is still an outcome, with the trace intact
@@ -178,9 +181,12 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"Task {args.id} requeued with your reply.")
         return 0
 
-    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-        console.print("[red]ANTHROPIC_API_KEY is not set.[/] Set it and run again.")
+    args.provider = args.provider or detect_provider()
+    if not args.provider:
+        console.print(f"[red]No model credentials found.[/] Set one of {', '.join(ENV_KEYS.values())}, "
+                      "or install Claude Code and sign in to use a Claude subscription.")
         return 2
+    console.print(f"[dim]Model provider: {PROVIDERS[args.provider]}[/]")
     if args.command == "work":
         return cmd_work(args, store, console)
     interactive = sys.stdin.isatty() and not args.no_input
