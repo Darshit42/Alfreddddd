@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from rich.console import Console
 
+from .prompts import conversation_note
 from .providers import PROVIDERS, list_models, make_llm
 from .store import Store
 from .team import run_team
@@ -50,6 +51,7 @@ class Session:
         self.report: str | None = None
         self.pending: dict | None = None     # a question or approval waiting for the human
         self.call: dict | None = None        # phone mode: {"status": ..., "transcript": [...]}
+        self.history: list[dict] = []        # the conversation so far: [{"task", "outcome"}]
         self._answer = None
         self._answered = threading.Event()
 
@@ -148,7 +150,7 @@ class Session:
 
         cfg = RunConfig(workspace=WORKSPACE, run_dir=run_dir, headed=headed, slow_mo=250 if headed else 0,
                         handbook=handbook.read_text(encoding="utf-8") if handbook.exists() else "",
-                        asker=asker, approver=approver)
+                        asker=asker, approver=approver, earlier_attempts=conversation_note(self.history))
         try:
             provider = self.config["provider"]
             llm = make_llm(provider, keyring.get_password("alfred", provider), self.config.get("model"))
@@ -160,6 +162,7 @@ class Session:
         self.report = str(trace.write_report(task, outcome).resolve())
         trace.close()
         self.outcome = outcome
+        self.history.append({"task": task, "outcome": outcome})
         from .voice import spoken_report
         return spoken_report(task, outcome)
 
@@ -235,6 +238,14 @@ def create_ui(session: Session) -> FastAPI:
         session.thread.start()
         return {"ok": True}
 
+    @api.post("/api/new")
+    def new_conversation():
+        if session.running:
+            return JSONResponse({"error": "Wait for the current task to finish."}, 409)
+        session.history.clear()
+        session.task, session.outcome, session.report, session.trace, session.call = "", None, None, None, None
+        return {"ok": True}
+
     @api.post("/api/reply")
     def reply(body: dict):
         session.answer(body.get("value"))
@@ -269,6 +280,8 @@ def create_ui(session: Session) -> FastAPI:
         return {"provider": cfg.get("provider"), "provider_name": PROVIDERS.get(cfg.get("provider") or "", ""),
                 "model": cfg.get("model"), "models": cfg.get("models", []), "running": session.running,
                 "task": session.task, "run": session.trace.run_dir.name if session.trace else None, "events": out, "total": len(events), "shot": shot_index,
+                "history": [{"task": h["task"], "status": h["outcome"]["status"],
+                             "summary": h["outcome"].get("summary", "")} for h in session.history],
                 "pending": session.pending, "call": session.call, "phone": cfg.get("phone", ""),
                 "outcome": session.outcome, "report": session.report,
                 "sandbox": f"http://127.0.0.1:{SANDBOX_PORT}/"}
@@ -348,7 +361,8 @@ td.pass{color:var(--ok);font-weight:600}td.fail{color:var(--bad);font-weight:600
 <span class="badge" id="provider"></span><select id="model"></select><button id="change">Change model</button></header>
 <main>
 <div class="col">
-  <div class="card"><h2>Task</h2>
+  <div class="card" id="convcard" style="display:none"><h2>Conversation <button id="newconv" class="small" style="float:right;padding:1px 8px">New conversation</button></h2><div id="conv"></div></div>
+  <div class="card"><h2 id="tasktitle">Task</h2>
     <textarea id="task" placeholder="Describe what you want done, in plain language"></textarea>
     <div class="chips" id="chips"></div>
     <div class="row"><label class="small"><input type="checkbox" id="headed"> Show browser</label>
@@ -406,7 +420,8 @@ $("cancel").onclick = () => $("setup").style.display = "none";
 $("change").onclick = () => $("setup").style.display = "flex";
 $("model").onchange = () => post("/api/model", {model: $("model").value});
 $("reset").onclick = async () => { await post("/api/sandbox/reset"); $("reset").textContent = "Reset done"; setTimeout(() => $("reset").textContent = "Reset demo data", 1500); };
-const start = async (task, phone) => { $("runerr").textContent = "";
+$("newconv").onclick = async () => { const r = await post("/api/new"); if (!r.ok) $("runerr").textContent = r.data.error; };
+const start = async (task, phone) => { $("runerr").textContent = ""; if (task) $("task").value = "";
   const r = await post("/api/run", {task, phone, headed: $("headed").checked, team: $("team").checked}); if (!r.ok) $("runerr").textContent = r.data.error; };
 $("run").onclick = () => { const task = $("task").value.trim(); if (task) start(task, $("phone").value.trim()); };
 $("callme").onclick = () => { const phone = $("phone").value.trim(); if (!phone) { $("runerr").textContent = "Enter your phone number first."; return; } start("", phone); };
@@ -433,7 +448,11 @@ async function tick() {
   $("callme").disabled = s.running;
   $("callcard").style.display = s.call ? "" : "none";
   if (s.call) $("callbox").innerHTML = `<b>${esc(s.call.status)}</b>` + (s.call.transcript || []).map(t => `<div class="small"><span class="who">${esc(t.role)}</span> ${esc(t.text)}</div>`).join("");
-  if (s.task && document.activeElement !== $("task") && s.running) $("task").value = s.task;
+  const turns = s.history.map(h => `<div class="ev"><b>${esc(h.task)}</b><div><span class="status ${h.status}" style="font-size:11px;padding:0 8px">${esc(h.status)}</span> <span class="small">${esc(h.summary)}</span></div></div>`).join("")
+    + (s.running && s.task ? `<div class="ev overseer"><b>${esc(s.task)}</b><div class="small mute">working…</div></div>` : "");
+  $("convcard").style.display = turns ? "" : "none"; if ($("conv").dataset.sig !== turns) { $("conv").dataset.sig = turns; $("conv").innerHTML = turns; }
+  $("tasktitle").textContent = s.history.length ? "Follow up, or give another task" : "Task";
+  $("task").placeholder = s.history.length ? "Continue the conversation: ask about the result, or say what to do next" : "Describe what you want done, in plain language";
   $("sandbox").href = s.sandbox; $("run").disabled = s.running; $("busy").textContent = s.running ? "· working…" : "";
   if (s.run !== runId) { runId = s.run; seen = 0; lastShot = null; $("timeline").innerHTML = "";
     $("plancard").style.display = "none"; $("resultcard").style.display = "none"; return; }

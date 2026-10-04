@@ -101,6 +101,26 @@ def worker_brief(task: str, today: str, handbook: str, lessons: dict[str, str], 
     return "\n\n".join(parts)
 
 
+def conversation_note(history: list[dict]) -> str:
+    """Carry a conversation across runs: each run starts with a fresh context, so what was asked and
+    found earlier is handed over as a compact record rather than a transcript."""
+    if not history:
+        return ""
+    turns = []
+    for i, h in enumerate(history[-6:], 1):
+        o = h["outcome"]
+        verified = {True: ", verified", False: ", NOT verified", None: ""}[o.get("verified")]
+        lines = [f"{i}. They asked: {h['task']}", f"   Outcome ({o['status']}{verified}): {o.get('summary', '')}"]
+        lines += [f"   - {d}" for d in (o.get("details") or [])[:6]]
+        lines += [f"   - {k}: {v}" for k, v in list((o.get("facts") or {}).items())[:8]]
+        turns.append("\n".join(lines))
+    return ("<conversation_so_far>\nThis is a continuing conversation with the same colleague. Earlier in it:\n"
+            + "\n".join(turns) + "\nTheir new message may build on this (\"it\", \"that file\", \"now do the "
+            "same for...\"). Read it in that light and reuse what was already found instead of redoing it, but "
+            "check again anything that may have changed since. If the new message is only a question about earlier "
+            "work, answer it in your finish summary.\n</conversation_so_far>")
+
+
 def verifier_brief(task: str, today: str, handbook: str, plan: dict, claim: dict) -> str:
     criteria = "\n".join(f"{i}. {c}" for i, c in enumerate(plan.get("success_criteria", []), 1))
     details = "\n".join(f"- {d}" for d in claim.get("details", []))

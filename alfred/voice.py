@@ -35,7 +35,7 @@ load_dotenv()
 
 AGENT_NAME = os.environ.get("ALFRED_VOICE_AGENT", "alfred-voice")
 VOICE_MODEL = os.environ.get("ALFRED_VOICE_MODEL", "gemini-3.8-live")
-VOICE_NAME = os.environ.get("ALFRED_VOICE_NAME", "Aoede")
+VOICE_NAME = os.environ.get("ALFRED_VOICE_NAME", "Charon")   # male; others: Puck, Fenrir, Orus (male), Aoede, Kore (female)
 VOICE_LANGUAGE = os.environ.get("ALFRED_VOICE_LANGUAGE", "hi-IN")   # handles English and Hinglish
 REQUIRED = ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "SIP_OUTBOUND_TRUNK_ID", "GOOGLE_API_KEY")
 RINGING_TIMEOUT_S = 30

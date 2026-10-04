@@ -26,6 +26,7 @@ from rich.table import Table
 from .policy import always_deny, auto_approve
 from .providers import ENV_KEYS, PROVIDERS, detect_provider, list_models, make_llm
 from .connectors import CONNECTORS
+from .prompts import conversation_note
 from .store import Store, prior_attempts_note
 from .team import ROLES, run_team
 from .trace import Trace
@@ -177,6 +178,7 @@ HELP = """[bold]Type a task in plain language and press Enter.[/]  Commands:
                     takes the next task by voice, does it, and calls back until you say you are done
   /add <task>       queue a task for later        /work    work through the queue unattended
   /status           queue, escalations, metrics   /answer <id> <reply>   answer an escalated task
+  /new              start a new conversation (follow-ups otherwise build on earlier tasks)
   /help             this list                     /exit    quit"""
 
 
@@ -271,6 +273,7 @@ def repl(console: Console) -> int:
         apply_model(args, config)
         console.print(f"[dim]Model: {PROVIDERS[args.provider]}" + (f" · {args.model}" if args.model else "") + "[/]")
     last: tuple[str, dict] | None = None
+    history: list[dict] = []     # the conversation so far; /new starts a fresh one
     while True:
         try:
             line = Prompt.ask("\n[bold cyan]alfred[/]").strip()
@@ -319,6 +322,10 @@ def repl(console: Console) -> int:
                 console.print(f"  [{colour}]{c.status:8}[/] {c.name:16} {c.summary} [dim](auth: {c.auth})[/]")
             for name, role in ROLES.items():
                 console.print(f"  role [bold]{name}[/]: {', '.join(role.connectors)}")
+        elif cmd == "/new":
+            history.clear()
+            last = None
+            console.print("Started a new conversation.")
         elif cmd == "/status":
             cmd_status(store, console)
         elif cmd == "/call":
@@ -343,7 +350,10 @@ def repl(console: Console) -> int:
             args.once = False
             cmd_work(args, store, console)
         else:
-            last = (line, execute(line, args, store, console, interactive=True, approve="ask"))
+            outcome = execute(line, args, store, console, interactive=True, approve="ask",
+                              earlier=conversation_note(history))
+            history.append({"task": line, "outcome": outcome})
+            last = (line, outcome)
 
 
 def main(argv: list[str] | None = None) -> int:
