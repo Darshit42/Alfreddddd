@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+import httpx
+import pytest
+from rich.console import Console
+
+from alfred.loop import run_loop
+from alfred.policy import always_deny, needs_approval
+from alfred.tools import Tool, ToolError, ToolResult, Toolset
+from alfred.tools.browser import BrowserSession
+from alfred.tools.files import Workspace
+from alfred.trace import Trace
+from alfred.worker import RunConfig, run_task
+
+from .conftest import ScriptedLLM, call, ref, say
+
+LOGIN = ("alfred", "sandbox-only-password")
+BILL = {"Vendor": "Kestrel Logistics", "Invoice number": "KL-2026-0926", "Invoice date": "2026-09-26",
+        "Due date": "2026-10-26", "Total amount": "184375.50", "Currency": "INR"}
+
+
+def quiet_trace(tmp_path) -> Trace:
+    return Trace(tmp_path / "run", Console(quiet=True))
+
+
+def sign_in(obs: str):
+    return [call("browser_fill", fields=[{"ref": ref(obs, "input", "Username"), "value": LOGIN[0]},
+                                         {"ref": ref(obs, "input", "Password"), "value": LOGIN[1]}])]
+
+
+def fill_bill(obs: str, **overrides):
+    values = BILL | overrides
+    kinds = {"Vendor": "select", "Currency": "select"}
+    return [call("browser_fill", fields=[{"ref": ref(obs, kinds.get(k, "input"), k), "value": v}
+                                         for k, v in values.items()])]
+
+
+# --------------------------------------------------------------------------- end to end
+def test_invoice_task_end_to_end(sandbox, tmp_path):
+    """Download an invoice, enter it in Ledger through a 503 and a session expiry, and get it verified."""
+    url = sandbox.url
+    seen: dict = {}
+
+    def keep(name):
+        def step(obs):
+            seen[name] = obs
+            return None
+        return step
+
+    worker = [
+        [call("plan", goal="Enter the latest Kestrel Logistics invoice in Ledger",
+              success_criteria=["Ledger has exactly one bill KL-2026-0926 for Kestrel Logistics, 184375.50 INR, due 2026-10-26"])],
+        [call("browser_navigate", url=f"{url}/mail?q=kestrel+logistics")],
+        lambda obs: [call("browser_click", ref=ref(obs, "link", "Invoice KL-2026-0926 for September linehaul"))],
+        lambda obs: [call("browser_click", ref=ref(obs, "link", "KL-2026-0926.pdf"))],
+        lambda obs: keep("download")(obs) or [call("read_file", path="downloads/KL-2026-0926.pdf")],
+        lambda obs: keep("pdf")(obs) or [call("browser_navigate", url=f"{url}/ledger/bills/new")],
+        sign_in,
+        lambda obs: [call("browser_snapshot")],
+        lambda obs: [call("browser_click", ref=ref(obs, "button", "Sign in"))],
+        # First attempt uses the invoice's own formats: Ledger must reject it with a readable message.
+        lambda obs: fill_bill(obs, **{"Total amount": "1,84,375.50", "Due date": "26 October 2026"}),
+        lambda obs: [call("browser_snapshot")],
+        lambda obs: [call("browser_click", ref=ref(obs, "button", "Save bill"))],          # chaos: 503
+        lambda obs: keep("first_save")(obs) or [call("browser_navigate", url=f"{url}/ledger/bills/new")],
+        lambda obs: fill_bill(obs, **{"Total amount": "1,84,375.50", "Due date": "26 October 2026"}),
+        lambda obs: [call("browser_snapshot")],
+        lambda obs: [call("browser_click", ref=ref(obs, "button", "Save bill"))],          # validation errors
+        lambda obs: keep("validation")(obs) or fill_bill(obs),
+        lambda obs: [call("browser_snapshot")],
+        lambda obs: [call("browser_click", ref=ref(obs, "button", "Save bill"))],          # saved
+        lambda obs: keep("saved")(obs) or [call("finish", status="success", summary="Entered KL-2026-0926.")],
+        # The reviewer hit an expired session, so the first finish is rejected. Sign in again, finish again.
+        lambda obs: keep("rejection")(obs) or [call("browser_navigate", url=f"{url}/ledger/bills")],
+        sign_in,
+        lambda obs: [call("browser_snapshot")],
+        lambda obs: [call("browser_click", ref=ref(obs, "button", "Sign in"))],
+        [call("finish", status="success", summary="Entered KL-2026-0926.", details=["Bill for 184375.50 INR"])],
+    ]
+
+    def judge(obs: str):
+        if "Sign in to Ledger" in obs:
+            return [call("submit_verdict", overall="inconclusive", feedback="Ledger showed a sign-in page.",
+                         checks=[{"criterion": "bill exists", "result": "unknown", "observed": "sign-in page"}])]
+        rows = [line for line in obs.splitlines() if "KL-2026-0926" in line]
+        ok = len(rows) == 1 and "184375.50" in rows[0] and "2026-10-26" in rows[0]
+        return [call("submit_verdict", overall="pass" if ok else "fail",
+                     checks=[{"criterion": "bill exists", "result": "pass" if ok else "fail", "observed": str(rows)}])]
+
+    verifier = [[call("browser_navigate", url=f"{url}/ledger/bills?vendor=Kestrel")], judge] * 2
+    llm = ScriptedLLM(worker, verifier)
+    trace = quiet_trace(tmp_path)
+    cfg = RunConfig(workspace=tmp_path / "ws", run_dir=trace.run_dir)
+    outcome = run_task("Enter the latest Kestrel Logistics invoice", llm, cfg, trace)
+
+    assert "Downloaded file to workspace: downloads/KL-2026-0926.pdf" in seen["download"]
+    assert "KL-2026-0926" in seen["pdf"] and "1,84,375.50" in seen["pdf"] and "26 October 2026" in seen["pdf"]
+    assert "HTTP status: 503" in seen["first_save"]
+    assert "Due date must be a valid date" in seen["validation"] and "Total amount must be" in seen["validation"]
+    assert "Bill saved." in seen["saved"]
+    assert "Not accepted" in seen["rejection"] and "sign-in page" in seen["rejection"]
+    assert outcome["status"] == "success" and outcome["verified"] is True
+
+    state = httpx.get(f"{url}/__sandbox/state").json()
+    entered = [b for b in state["bills"] if b["invoice_number"] == "KL-2026-0926"]
+    assert len(entered) == 1, "the failed and rejected attempts must not have created duplicates"
+    assert entered[0]["amount"] == 184375.50 and entered[0]["due_date"] == "2026-10-26"
+    assert entered[0]["vendor"] == "Kestrel Logistics" and entered[0]["created_by"] == "alfred"
+    assert trace.write_report("t", outcome).exists()
+
+
+def test_unverifiable_success_is_not_reported_as_success(sandbox, tmp_path):
+    worker = [[call("plan", goal="g", success_criteria=["bill X exists"])]] + \
+             [[call("finish", status="success", summary="Done!")]] * 3
+    fail = [[call("submit_verdict", overall="fail", feedback="No such bill.",
+                  checks=[{"criterion": "bill X exists", "result": "fail", "observed": "not in the list"}])]] * 3
+    trace = quiet_trace(tmp_path)
+    outcome = run_task("t", ScriptedLLM(worker, fail), RunConfig(workspace=tmp_path / "ws", run_dir=trace.run_dir), trace)
+    assert outcome["status"] == "unverified" and outcome["verified"] is False
+    assert outcome["verdict"]["overall"] == "fail"
+
+
+# --------------------------------------------------------------------------- browser guards
+@pytest.fixture()
+def session(tmp_path):
+    s = BrowserSession(tmp_path / "dl", tmp_path / "shots")
+    yield s
+    s.close()
+
+
+def login(browser, url):
+    obs = browser.navigate(f"{url}/ledger/login").text
+    browser.fill([{"ref": ref(obs, "input", "Username"), "value": LOGIN[0]},
+                  {"ref": ref(obs, "input", "Password"), "value": LOGIN[1]}])
+    return browser.click(ref(obs, "button", "Sign in")).text
+
+
+def test_risky_click_needs_approval(sandbox, session):
+    asked = []
+    browser = session.open("w", approver=lambda action, url: asked.append(action) or False)
+    login(browser, sandbox.url)
+    obs = browser.navigate(f"{sandbox.url}/ledger/bills/2").text
+    with pytest.raises(ToolError, match="needs human approval"):
+        browser.click(ref(obs, "button", "Mark as paid"))
+    assert asked == ['Click "Mark as paid"']
+    bills = httpx.get(f"{sandbox.url}/__sandbox/state").json()["bills"]
+    assert next(b for b in bills if b["id"] == 2)["status"] == "unpaid"
+    assert needs_approval("Delete bill") and not needs_approval("Save bill") and not needs_approval("Sign in")
+
+
+def test_read_only_browser_cannot_change_anything(sandbox, session):
+    login(session.open("w", approver=always_deny), sandbox.url)
+    reviewer = session.open("v", read_only=True)       # shares the signed-in cookie jar
+    obs = reviewer.navigate(f"{sandbox.url}/ledger/bills/2").text
+    assert "Bill #2" in obs
+    with pytest.raises(ToolError, match="read-only"):
+        reviewer.click(ref(obs, "button", "Delete bill"))
+    assert len(httpx.get(f"{sandbox.url}/__sandbox/state").json()["bills"]) == 6
+
+
+def test_stale_ref_is_an_explainable_error(sandbox, session):
+    browser = session.open("w")
+    browser.navigate(f"{sandbox.url}/mail")
+    with pytest.raises(ToolError, match="not on the current page"):
+        browser.click("e999")
+
+
+# --------------------------------------------------------------------------- loop and tools
+def test_loop_turns_failures_into_observations_and_stops_when_stuck(tmp_path):
+    def boom():
+        raise RuntimeError("kaboom")
+
+    tools = Toolset([Tool("boom", "", {}, boom), Tool("done", "", {}, lambda: ToolResult("ok", final=True))])
+    llm = ScriptedLLM([[say("thinking out loud")], [call("nope")], [call("boom", extra=1)]] + [[call("boom")]] * 6)
+    messages = [{"role": "user", "content": "go"}]
+    end = run_loop(llm=llm, system="", messages=messages, tools=tools, trace=quiet_trace(tmp_path),
+                   role="worker", max_steps=20)
+    assert end.reason == "stalled"
+    joined = "\n".join(llm.observations)
+    assert "without calling a tool" in joined            # plain text reply gets a nudge
+    assert "Unknown tool 'nope'" in joined               # hallucinated tool
+    assert "unknown parameters: extra" in joined         # bad arguments
+    assert "RuntimeError: kaboom" in joined              # a crash is an observation, not a crash
+    assert "same call three times" in "\n".join(str(m["content"]) for m in messages)
+
+
+def test_workspace_confines_paths(tmp_path):
+    ws = Workspace(tmp_path / "ws")
+    ws.write_file("out/report.csv", "a,b\n")
+    assert "out/report.csv" in ws.list_files("out")
+    with pytest.raises(ToolError, match="outside the workspace"):
+        ws.read_file("../secret.txt")
