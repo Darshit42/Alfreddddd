@@ -140,6 +140,8 @@ def run_team(task: str, llm, cfg: RunConfig, trace: Trace) -> dict:
 
     def supervise() -> str | None:
         cfg.heartbeat()
+        if cfg.should_stop():
+            return "cancelled"
         return "budget" if hasattr(llm, "cost") and llm.cost() > cfg.max_cost_usd else None
 
     end = run_loop(llm=llm, system=OVERSEER_SYSTEM.format(roster=roster), messages=messages, tools=tools,

@@ -52,6 +52,8 @@ class Session:
         self.pending: dict | None = None     # a question or approval waiting for the human
         self.call: dict | None = None        # phone mode: {"status": ..., "transcript": [...]}
         self.history: list[dict] = []        # the conversation so far: [{"task", "outcome"}]
+        self.cancelled = False               # Stop was pressed: the run ends before its next step
+        self.discard = False                 # New chat was pressed mid-run: do not keep its result
         self._answer = None
         self._answered = threading.Event()
 
@@ -71,6 +73,8 @@ class Session:
         away from the keyboard: Alfred phones them, asks the same thing by voice, and uses that answer. If the
         call gets no answer either, the dialog simply keeps waiting.
         """
+        if self.cancelled:
+            return None if pending["kind"] == "question" else False
         self._answered.clear()
         self.pending = pending
         phone = self.config.get("phone")
@@ -103,6 +107,13 @@ class Session:
         self.answer(value)
         return f"No response on screen for {AFK_SECONDS:.0f}s; phoned {phone}. Answer by phone: {value}"
 
+    def stop(self, discard: bool = False) -> None:
+        """Ask the running task to stop. It ends before its next step; an open dialog is dismissed."""
+        self.cancelled = True
+        self.discard = self.discard or discard
+        if self.pending:
+            self.answer(None if self.pending["kind"] == "question" else False)
+
     def answer(self, value) -> None:
         self._answer = value
         self._answered.set()
@@ -116,7 +127,7 @@ class Session:
                 report = self.run_one(task, headed, team)
             if not phone:
                 return
-            while True:
+            while not self.cancelled:
                 self.call = {"status": f"Calling {phone} ...", "transcript": []}
                 result = voice.call_user(phone, report)
                 self.call = {"transcript": result.get("transcript", []), "status": (
@@ -150,7 +161,8 @@ class Session:
 
         cfg = RunConfig(workspace=WORKSPACE, run_dir=run_dir, headed=headed, slow_mo=250 if headed else 0,
                         handbook=handbook.read_text(encoding="utf-8") if handbook.exists() else "",
-                        asker=asker, approver=approver, earlier_attempts=conversation_note(self.history))
+                        asker=asker, approver=approver, earlier_attempts=conversation_note(self.history),
+                        should_stop=lambda: self.cancelled)
         try:
             provider = self.config["provider"]
             llm = make_llm(provider, keyring.get_password("alfred", provider), self.config.get("model"))
@@ -161,6 +173,8 @@ class Session:
         store.end_run(run_dir.name, outcome)
         self.report = str(trace.write_report(task, outcome).resolve())
         trace.close()
+        if self.discard:
+            return ""
         self.outcome = outcome
         self.history.append({"task": task, "outcome": outcome})
         from .voice import spoken_report
@@ -232,7 +246,7 @@ def create_ui(session: Session) -> FastAPI:
         elif not body.task.strip():
             return JSONResponse({"error": "Type a task first."}, 400)
         session.task, session.outcome, session.report, session.trace = body.task.strip(), None, None, None
-        session.call = None
+        session.call, session.cancelled, session.discard = None, False, False
         session.thread = threading.Thread(target=session.run, args=(session.task, body.headed, body.team, phone),
                                           daemon=True)
         session.thread.start()
@@ -240,10 +254,16 @@ def create_ui(session: Session) -> FastAPI:
 
     @api.post("/api/new")
     def new_conversation():
+        """Erase the session. If a task is running it is stopped and its result thrown away."""
         if session.running:
-            return JSONResponse({"error": "Wait for the current task to finish."}, 409)
+            session.stop(discard=True)
         session.history.clear()
         session.task, session.outcome, session.report, session.trace, session.call = "", None, None, None, None
+        return {"ok": True}
+
+    @api.post("/api/stop")
+    def stop():
+        session.stop()
         return {"ok": True}
 
     @api.post("/api/reply")
@@ -278,7 +298,7 @@ def create_ui(session: Session) -> FastAPI:
                 out.append(e)
         cfg = session.config
         return {"provider": cfg.get("provider"), "provider_name": PROVIDERS.get(cfg.get("provider") or "", ""),
-                "model": cfg.get("model"), "models": cfg.get("models", []), "running": session.running,
+                "model": cfg.get("model"), "models": cfg.get("models", []), "running": session.running, "stopping": session.running and session.cancelled,
                 "task": session.task, "run": session.trace.run_dir.name if session.trace else None, "events": out, "total": len(events), "shot": shot_index,
                 "history": [{"task": h["task"], "status": h["outcome"]["status"],
                              "summary": h["outcome"].get("summary", "")} for h in session.history],
@@ -358,7 +378,8 @@ td.pass{color:var(--ok);font-weight:600}td.fail{color:var(--bad);font-weight:600
 .prov.sel{border-color:var(--accent);background:#eef3ff} .error{color:var(--bad);margin-top:8px}
 </style></head><body>
 <header><h1>Alfred</h1><span class="mute small" style="color:#aab4c4">autonomous AI worker</span><span class="sp"></span>
-<span class="badge" id="provider"></span><select id="model"></select><button id="change">Change model</button></header>
+<button id="stop" style="display:none;background:#b3261e;border-color:#b3261e;color:#fff">Stop</button>
+<button id="newchat">New chat</button><span class="badge" id="provider"></span><select id="model"></select><button id="change">Change model</button></header>
 <main>
 <div class="col">
   <div class="card" id="convcard" style="display:none"><h2>Conversation <button id="newconv" class="small" style="float:right;padding:1px 8px">New conversation</button></h2><div id="conv"></div></div>
@@ -420,6 +441,8 @@ $("cancel").onclick = () => $("setup").style.display = "none";
 $("change").onclick = () => $("setup").style.display = "flex";
 $("model").onchange = () => post("/api/model", {model: $("model").value});
 $("reset").onclick = async () => { await post("/api/sandbox/reset"); $("reset").textContent = "Reset done"; setTimeout(() => $("reset").textContent = "Reset demo data", 1500); };
+$("stop").onclick = () => post("/api/stop");
+$("newchat").onclick = () => post("/api/new");
 $("newconv").onclick = async () => { const r = await post("/api/new"); if (!r.ok) $("runerr").textContent = r.data.error; };
 const start = async (task, phone) => { $("runerr").textContent = ""; if (task) $("task").value = "";
   const r = await post("/api/run", {task, phone, headed: $("headed").checked, team: $("team").checked}); if (!r.ok) $("runerr").textContent = r.data.error; };
@@ -449,11 +472,12 @@ async function tick() {
   $("callcard").style.display = s.call ? "" : "none";
   if (s.call) $("callbox").innerHTML = `<b>${esc(s.call.status)}</b>` + (s.call.transcript || []).map(t => `<div class="small"><span class="who">${esc(t.role)}</span> ${esc(t.text)}</div>`).join("");
   const turns = s.history.map(h => `<div class="ev"><b>${esc(h.task)}</b><div><span class="status ${h.status}" style="font-size:11px;padding:0 8px">${esc(h.status)}</span> <span class="small">${esc(h.summary)}</span></div></div>`).join("")
-    + (s.running && s.task ? `<div class="ev overseer"><b>${esc(s.task)}</b><div class="small mute">working…</div></div>` : "");
+    + (s.running && s.task && !s.stopping ? `<div class="ev overseer"><b>${esc(s.task)}</b><div class="small mute">working…</div></div>` : "");
   $("convcard").style.display = turns ? "" : "none"; if ($("conv").dataset.sig !== turns) { $("conv").dataset.sig = turns; $("conv").innerHTML = turns; }
   $("tasktitle").textContent = s.history.length ? "Follow up, or give another task" : "Task";
   $("task").placeholder = s.history.length ? "Continue the conversation: ask about the result, or say what to do next" : "Describe what you want done, in plain language";
-  $("sandbox").href = s.sandbox; $("run").disabled = s.running; $("busy").textContent = s.running ? "· working…" : "";
+  $("sandbox").href = s.sandbox; $("run").disabled = s.running; $("busy").textContent = s.stopping ? "· stopping after the current step…" : s.running ? "· working…" : "";
+  $("stop").style.display = s.running && !s.stopping ? "" : "none";
   if (s.run !== runId) { runId = s.run; seen = 0; lastShot = null; $("timeline").innerHTML = "";
     $("plancard").style.display = "none"; $("resultcard").style.display = "none"; return; }
   const tl = $("timeline"); const stick = tl.scrollTop + tl.clientHeight >= tl.scrollHeight - 30;

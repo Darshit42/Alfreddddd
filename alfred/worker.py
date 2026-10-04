@@ -37,6 +37,7 @@ class RunConfig:
     earlier_attempts: str = ""   # extra context: a retried or answered task, or a brief from the overseer
     connectors: tuple[str, ...] = ("browser", "files")   # which connectors this worker's role is granted
     heartbeat: Callable[[], None] = field(default=lambda: None)   # keeps the task lease alive
+    should_stop: Callable[[], bool] = field(default=lambda: False)  # the user pressed Stop
     approver: Approver = always_deny
     asker: Asker = field(default=lambda q, o: None)
 
@@ -65,6 +66,8 @@ def run_task(task: str, llm, cfg: RunConfig, trace: Trace, announce: bool = True
 
     def supervise() -> str | None:
         cfg.heartbeat()
+        if cfg.should_stop():
+            return "cancelled"
         spent = llm.cost() if hasattr(llm, "cost") else 0.0
         if spent > cfg.max_cost_usd:
             trace.event("harness", note=f"Cost cap reached (${spent:.2f} > ${cfg.max_cost_usd:.2f}): stopping the run.")
@@ -169,6 +172,7 @@ def run_task(task: str, llm, cfg: RunConfig, trace: Trace, announce: bool = True
         reasons = {"max_steps": f"Stopped after the budget of {cfg.max_steps} steps without finishing.",
                    "stalled": "Stopped because the agent stopped making progress.",
                    "refusal": "The model declined to continue with this task.",
+                   "cancelled": "Stopped by the user before it finished. Anything already done stays done.",
                    "budget": f"Stopped by the supervisor: the cost cap of ${cfg.max_cost_usd:.2f} was reached."}
         outcome = {"status": "incomplete", "summary": reasons[end.reason], "details": [], "verified": None}
     outcome.update(plan=state["plan"], facts=state["facts"], verdict=state["verdict"], steps=end.steps,
