@@ -25,8 +25,10 @@ in. Nothing about the task is hard-coded in the agent.
 | Observability: logs every action | Append-only decision log, screenshots, HTML report | `store.py`, `trace.py` |
 | Outcome you can trust | Independent read-only verification of every "done" | `verifier.py` |
 
+| Roles with scoped access | Overseer dispatches sub-agents; a role is a list of connectors | `team.py`, `connectors.py` |
+
 Not built: a workflow engine (the model plans each run from scratch), knowledge retrieval over documents,
-and per-role permissions (there is one policy per workspace).
+and connectors beyond browser and files (see Roadmap).
 
 ## Setup
 
@@ -164,6 +166,58 @@ layer** (the model) is invoked for one thing only: the judgment of how to carry 
 - **`store.py`** — the queue (atomic leases, heartbeat, reclaim), run records, decision log, metrics.
 - **`sandbox/`** — the simulated company. The agent never imports it; it only sees it through the browser.
 
+## Overseer and sub-agents
+
+```
+                         request
+                            │
+                 ┌──────────▼──────────┐
+                 │  overseer (team.py) │  never touches a system: splits, dispatches,
+                 │  delegate · ask ·   │  reads results, re-dispatches or escalates, reports
+                 │  finish             │
+                 └───┬─────────────┬───┘
+        brief + facts│             │brief + facts
+              ┌──────▼─────┐ ┌─────▼──────┐
+              │ operator   │ │ analyst    │   each sub-agent: fresh context, own plan,
+              │ browser +  │ │ files only │   own independent verification
+              │ files      │ │            │
+              └────────────┘ └────────────┘
+```
+
+`--team` (CLI), `/team` (terminal session) or the "Overseer + sub-agents" box (desktop app) switches from a
+single worker to this shape. It is the structure of Apiary, my earlier coding-agent fleet (dispatcher,
+isolated agents, a control plane that has the last word), applied to operations work:
+
+- **A role is a list of connectors, enforced in code.** The analyst is not told "do not use the browser";
+  it is never handed browser tools.
+- **Sub-agents are isolated.** Each gets only the brief and facts the overseer passes, not the original
+  request or another agent's transcript, so one agent's confusion does not leak into the next.
+- **The overseer proposes, the harness decides.** It cannot report `success` while any sub-task it
+  dispatched ended otherwise with no later sub-agent succeeding; the call is rejected and it must
+  re-delegate or report honestly.
+- **Single worker stays the default.** For one job, an overseer only adds latency and cost.
+
+## Connectors and roadmap
+
+A connector is a named bundle of tools plus the credential it needs (`connectors.py` states the contract:
+tools that fail readably, credentials from the keyring and never shown to the model, every write through
+the enforcer and into the decision log, read-only tools for the verifier).
+
+| Connector | Status |
+|---|---|
+| `browser` — any web application through a real browser | Built |
+| `files` — read anywhere locally, write in the workspace, PDFs as text | Built |
+| `gmail` — search, read, draft; sending is an approval-gated write | Planned |
+| `google-sheets`, `google-docs`, `google-calendar` | Planned |
+| `slack` — read channels, post messages and escalations | Planned |
+| `http-api` — call a documented REST API instead of driving its UI | Planned |
+
+The planned ones are declared, not stubbed: nothing in the repo pretends to send an email. Until a native
+connector exists, the browser connector already reaches these products through their web UIs, slowly.
+Adding one means writing its tools, an OAuth credential provider, and enforcer rules for its writes; the
+loop, verifier, overseer, queue and decision log do not change. New roles then become one-line grants,
+for example a `finance-clerk` with `browser + google-sheets` and a `comms` role with `gmail + slack`.
+
 ## Design decisions and why
 
 **The model plans; the harness controls.** There is no hand-written workflow or planner graph. A capable
@@ -248,6 +302,8 @@ or `incomplete`. The exit code is 0 only for verified success.
 - **Verified live with one provider.** Two tasks (invoice entry; an approval-gated payment) were run end
   to end on Claude via Claude Code. The Anthropic-key, OpenAI and Gemini adapters are written against
   their SDKs but have not been run, and the cost cap only knows Claude prices.
+- **Sub-agents run one at a time**, each in its own browser session (so each signs in again). The
+  overseer adds a few model calls of overhead; it is worth it for compound requests, not single jobs.
 - **The desktop app is a Python app in a native window**, not a packaged installer. It runs one task at
   a time; the queue is CLI-only.
 - **Only exercised live in the sandbox.** Real sites bring iframes, shadow DOM, infinite scroll, popups
@@ -276,8 +332,10 @@ or `incomplete`. The exit code is 0 only for verified success.
 4. More tools behind the same interface: an HTTP/API tool, email sending, spreadsheets; a vision
    fallback for pages the text snapshot cannot represent.
 5. A secrets broker so the model never sees credentials, and per-task scoped permissions.
-6. A dashboard over the SQLite store: live timeline, approval inbox, decisions, metrics.
-7. A triage step before dispatch: hard gates plus one cheap model call to route a task to the worker or
+6. Native connectors (Gmail, Sheets, Docs, Calendar, Slack, HTTP APIs) per the contract above, and
+   sub-agents running in parallel under leases once two of them can no longer collide on one record.
+7. A dashboard over the SQLite store: live timeline, approval inbox, decisions, metrics.
+8. A triage step before dispatch: hard gates plus one cheap model call to route a task to the worker or
    straight to a human, using the decision log as its training signal.
 
 ## Models, APIs and components used

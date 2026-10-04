@@ -11,6 +11,7 @@ from alfred.tools import Tool, ToolError, ToolResult, Toolset
 from alfred.tools.browser import BrowserSession
 from alfred.tools.files import Workspace
 from alfred.trace import Trace
+from alfred.team import run_team
 from alfred.worker import RunConfig, run_task
 
 from .conftest import ScriptedLLM, call, ref, say
@@ -283,3 +284,53 @@ def test_decision_log_and_metrics(tmp_path):
     m = store.metrics()
     assert (m["runs"], m["verified"], m["escalated"]) == (2, 1, 1)
     assert round(m["cost_per_verified"], 2) == 0.60       # fully loaded: escalated spend counts too
+
+
+# --------------------------------------------------------------------------- overseer and sub-agents
+class TeamLLM:
+    """Routes scripted steps by which agent is asking: overseer, worker or verifier."""
+
+    def __init__(self, overseer, worker, verifier):
+        self.scripts = {"overseer": iter(overseer), "worker": iter(worker), "verifier": iter(verifier)}
+        self.usage = type("U", (), {"calls": 0})()
+        self.tools_seen: list[set] = []
+        self.seen: list[str] = []
+
+    def complete(self, system, messages, tools):
+        role = ("overseer" if system.startswith("You are the overseer") else
+                "verifier" if system.startswith("You are an independent reviewer") else "worker")
+        if role == "worker" and len(messages) == 1:
+            self.tools_seen.append({t["name"] for t in tools})
+            self.seen.append(messages[0]["content"])
+        content = messages[-1]["content"]
+        last = content if isinstance(content, str) else "\n".join(b.get("content") or "" for b in content)
+        step = next(self.scripts[role])
+        blocks = step(last) if callable(step) else step
+        from types import SimpleNamespace
+        return SimpleNamespace(content=blocks, stop_reason="tool_use", usage=None)
+
+
+def test_overseer_dispatches_role_scoped_subagents_and_cannot_overclaim(tmp_path):
+    results = []
+    overseer = [
+        [call("delegate", role="operator", task="Enter invoice X in Ledger")],
+        lambda obs: results.append(obs) or [call("delegate", role="analyst", task="Summarise it", context="bill id 7")],
+        lambda obs: results.append(obs) or [call("finish", status="success", summary="All done")],   # overclaim
+        lambda obs: results.append(obs) or [call("finish", status="partial", summary="Invoice entered; summary failed")],
+    ]
+    worker = [
+        [call("plan", goal="g", success_criteria=["c"])], [call("finish", status="success", summary="Entered as #7")],
+        [call("finish", status="failed", summary="No file to summarise")],
+    ]
+    verifier = [[call("submit_verdict", overall="pass", checks=[{"criterion": "c", "result": "pass", "observed": "ok"}])]]
+    llm = TeamLLM(overseer, worker, verifier)
+    trace = quiet_trace(tmp_path)
+    outcome = run_team("Enter invoice X and summarise it", llm, RunConfig(workspace=tmp_path / "ws", run_dir=trace.run_dir), trace)
+
+    assert "browser_click" in llm.tools_seen[0] and "write_file" in llm.tools_seen[0]        # operator
+    assert not any(t.startswith("browser_") for t in llm.tools_seen[1]) and "read_file" in llm.tools_seen[1]   # analyst
+    assert "bill id 7" in llm.seen[1] and "Enter invoice X and summarise" not in llm.seen[1]   # own brief only
+    assert "Status: success" in results[0] and "verification: passed" in results[0]
+    assert "Status: failed" in results[1]
+    assert "Cannot report success" in results[2]          # the harness, not the overseer, decides
+    assert outcome["status"] == "partial" and outcome["agents"] == 2 and outcome["verified"] is None

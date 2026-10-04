@@ -34,7 +34,8 @@ class RunConfig:
     verify: bool = True
     max_verify_rounds: int = 2   # how many times a rejected "success" may be reworked
     max_cost_usd: float = 10.0   # supervisor cap: the run is stopped when estimated spend passes this
-    earlier_attempts: str = ""   # context for a retried or answered task (from the queue)
+    earlier_attempts: str = ""   # extra context: a retried or answered task, or a brief from the overseer
+    connectors: tuple[str, ...] = ("browser", "files")   # which connectors this worker's role is granted
     heartbeat: Callable[[], None] = field(default=lambda: None)   # keeps the task lease alive
     approver: Approver = always_deny
     asker: Asker = field(default=lambda q, o: None)
@@ -53,7 +54,7 @@ class Lessons:
         self.path.write_text(json.dumps(self.items, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def run_task(task: str, llm, cfg: RunConfig, trace: Trace) -> dict:
+def run_task(task: str, llm, cfg: RunConfig, trace: Trace, announce: bool = True) -> dict:
     today = date.today().isoformat()
     workspace = Workspace(cfg.workspace)
     lessons = Lessons(cfg.workspace / ".alfred" / "lessons.json")
@@ -71,7 +72,8 @@ def run_task(task: str, llm, cfg: RunConfig, trace: Trace) -> dict:
         return None
 
     state: dict = {"plan": None, "facts": {}, "verdict": None, "rejections": 0}
-    trace.event("task", task=task)
+    if announce:
+        trace.event("task", task=task)
 
     # ---------------------------------------------------------------- control tools
     def plan(goal: str, success_criteria: list, steps: list | None = None, assumptions: list | None = None) -> str:
@@ -148,7 +150,8 @@ def run_task(task: str, llm, cfg: RunConfig, trace: Trace) -> dict:
                                                     "files written, anything unusual you noticed."}},
              finish, required=("status", "summary")),
     ]
-    tools = Toolset(browser.tools() + workspace.tools() + control)
+    granted = {"browser": browser.tools(), "files": workspace.tools()}
+    tools = Toolset([t for name in cfg.connectors for t in granted[name]] + control)
     messages = [{"role": "user", "content": worker_brief(task, today, cfg.handbook, lessons.items,
                                                             cfg.earlier_attempts)}]
 

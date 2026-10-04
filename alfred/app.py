@@ -26,6 +26,7 @@ from rich.console import Console
 
 from .providers import PROVIDERS, list_models, make_llm
 from .store import Store
+from .team import run_team
 from .trace import Trace
 from .worker import RunConfig, run_task
 
@@ -69,7 +70,7 @@ class Session:
         self._answer = value
         self._answered.set()
 
-    def run(self, task: str, headed: bool) -> None:
+    def run(self, task: str, headed: bool, team: bool = False) -> None:
         run_dir = Path("runs") / datetime.now().strftime("%Y%m%d-%H%M%S")
         store = Store(WORKSPACE / ".alfred" / "alfred.db")      # SQLite connections are per thread
         store.start_run(run_dir.name, task)
@@ -90,7 +91,7 @@ class Session:
         try:
             provider = self.config["provider"]
             llm = make_llm(provider, keyring.get_password("alfred", provider), self.config.get("model"))
-            outcome = run_task(task, llm, cfg, trace)
+            outcome = (run_team if team else run_task)(task, llm, cfg, trace)
         except Exception as e:  # noqa: BLE001 - show the failure in the UI rather than dying silently
             trace.event("harness", note=f"Run aborted: {type(e).__name__}: {e}")
             outcome = {"status": "incomplete", "summary": f"The run aborted: {type(e).__name__}: {e}", "details": []}
@@ -108,6 +109,7 @@ class Connect(BaseModel):
 class Start(BaseModel):
     task: str
     headed: bool = False
+    team: bool = False
 
 
 def create_ui(session: Session) -> FastAPI:
@@ -153,7 +155,7 @@ def create_ui(session: Session) -> FastAPI:
         if not session.config.get("provider"):
             return JSONResponse({"error": "Connect a model first."}, 400)
         session.task, session.outcome, session.report, session.trace = body.task.strip(), None, None, None
-        session.thread = threading.Thread(target=session.run, args=(session.task, body.headed), daemon=True)
+        session.thread = threading.Thread(target=session.run, args=(session.task, body.headed, body.team), daemon=True)
         session.thread.start()
         return {"ok": True}
 
@@ -252,7 +254,7 @@ ul{margin:4px 0;padding-left:18px} .mute{color:var(--mute)} .small{font-size:12p
 #shot{width:100%;border:1px solid var(--line);border-radius:8px;display:none}
 #timeline{flex:1;min-height:200px;overflow:auto}
 .ev{border-left:3px solid var(--line);padding:3px 10px;margin:5px 0;font-size:13px}
-.ev.verifier{border-color:#9a5bd0;background:#faf6fd}.ev.harness,.ev.write{border-color:#d9a400;background:#fffaea}
+.ev.verifier{border-color:#9a5bd0;background:#faf6fd}.ev.overseer{border-color:#2f5bd8;background:#f1f5ff}.ev.harness,.ev.write{border-color:#d9a400;background:#fffaea}
 .ev .say{color:#3b4656}.ev code{font-size:12px;word-break:break-all}.ev .res{color:var(--mute);font-size:12px}
 .ev .res.err{color:var(--bad)} .who{font-size:11px;color:var(--mute);text-transform:uppercase;letter-spacing:.04em}
 .status{display:inline-block;padding:2px 12px;border-radius:12px;font-weight:600;color:#fff;background:var(--mute)}
@@ -272,7 +274,8 @@ td.pass{color:var(--ok);font-weight:600}td.fail{color:var(--bad);font-weight:600
   <div class="card"><h2>Task</h2>
     <textarea id="task" placeholder="Describe what you want done, in plain language"></textarea>
     <div class="chips" id="chips"></div>
-    <div class="row"><label class="small"><input type="checkbox" id="headed"> Show the browser window</label><span class="sp"></span>
+    <div class="row"><label class="small"><input type="checkbox" id="headed"> Show browser</label>
+    <label class="small" title="An overseer splits the request and dispatches role-scoped sub-agents"><input type="checkbox" id="team"> Overseer + sub-agents</label><span class="sp"></span>
     <button class="primary" id="run">Run</button></div>
     <div class="row small mute"><a id="sandbox" href="#" target="_blank">Open the demo company</a><span class="sp"></span>
     <button id="reset" class="small">Reset demo data</button></div>
@@ -302,7 +305,8 @@ const EXAMPLES = [
  "Bluepine Stationers emailed us about a change to their billing contact. Make sure Ledger reflects it.",
  "Which of our unpaid bills are overdue today? Save them to overdue.csv and tell me the totals per currency.",
  "Enter the latest Kestrel invoice into Ledger.",
- "Mark the August Kestrel Logistics bill as paid."];
+ "Mark the August Kestrel Logistics bill as paid.",
+ "Enter the latest Kestrel Logistics invoice into Ledger, and update Bluepine Stationers' billing contact from their email."];
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const post = (url, body) => fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body || {})}).then(async r => ({ok: r.ok, data: await r.json()}));
@@ -322,14 +326,14 @@ $("change").onclick = () => $("setup").style.display = "flex";
 $("model").onchange = () => post("/api/model", {model: $("model").value});
 $("reset").onclick = async () => { await post("/api/sandbox/reset"); $("reset").textContent = "Reset done"; setTimeout(() => $("reset").textContent = "Reset demo data", 1500); };
 $("run").onclick = async () => { const task = $("task").value.trim(); if (!task) return; $("runerr").textContent = "";
-  const r = await post("/api/run", {task, headed: $("headed").checked}); if (!r.ok) $("runerr").textContent = r.data.error; };
+  const r = await post("/api/run", {task, headed: $("headed").checked, team: $("team").checked}); if (!r.ok) $("runerr").textContent = r.data.error; };
 
 function render(ev) {
-  const who = ev.role === "verifier" ? "verifier" : "worker";
+  const who = ev.role === "verifier" || ev.role === "overseer" ? ev.role : "worker";
   if (ev.kind === "llm") { const t = ev.thinking || ev.text; if (!t) return "";
     return `<div class="ev ${who}"><span class="who">${who} · step ${ev.step}</span><div class="say">${esc(t)}</div></div>`; }
   if (ev.kind === "tool") return `<div class="ev ${who}"><code>${esc(ev.name)} ${esc(JSON.stringify(ev.args)).slice(0, 220)}</code><div class="res ${ev.is_error ? "err" : ""}">${esc(ev.result).slice(0, 260)}</div></div>`;
-  if (ev.kind === "harness") return `<div class="ev harness"><span class="who">harness</span> ${esc(ev.note)}</div>`;
+  if (ev.kind === "harness") return `<div class="ev harness"><span class="who">${ev.role === "overseer" ? "overseer" : "harness"}</span> ${esc(ev.note)}</div>`;
   if (ev.kind === "write") return `<div class="ev write"><span class="who">enforcer</span> ${esc(ev.method)} ${esc(ev.url)} → <b>${esc(ev.verdict)}</b></div>`;
   if (ev.kind === "verdict") return `<div class="ev verifier"><span class="who">independent verification: ${esc(ev.overall)}</span>${checks(ev)}</div>`;
   return "";

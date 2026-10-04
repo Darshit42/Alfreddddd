@@ -24,7 +24,9 @@ from rich.table import Table
 
 from .policy import always_deny, auto_approve
 from .providers import ENV_KEYS, PROVIDERS, detect_provider, list_models, make_llm
+from .connectors import CONNECTORS
 from .store import Store, prior_attempts_note
+from .team import ROLES, run_team
 from .trace import Trace
 from .worker import RunConfig, run_task
 
@@ -44,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_opts.add_argument("--max-steps", type=int, default=40)
     run_opts.add_argument("--max-cost", type=float, default=10.0, metavar="USD", help="stop a run past this spend")
     run_opts.add_argument("--no-verify", action="store_true", help="skip independent verification")
+    run_opts.add_argument("--team", action="store_true",
+                          help="use the overseer: split the request and dispatch role-scoped sub-agents")
     run_opts.add_argument("--provider", choices=list(PROVIDERS), default=None,
                           help="model provider (default: whichever credential is found; see README)")
     run_opts.add_argument("--model", default=None, help="model name for the chosen provider")
@@ -103,7 +107,8 @@ def execute(task: str, args, store: Store, console: Console, *, task_id: int | N
         earlier_attempts=earlier, heartbeat=(lambda: store.heartbeat(task_id)) if task_id else (lambda: None))
 
     try:
-        outcome = run_task(task, make_llm(args.provider, model=args.model), cfg, trace)
+        runner = run_team if args.team else run_task
+        outcome = runner(task, make_llm(args.provider, model=args.model), cfg, trace)
     except KeyboardInterrupt:
         outcome = {"status": "incomplete", "summary": "Interrupted by the user.", "details": []}
     except Exception as e:  # noqa: BLE001 - an infrastructure failure is still an outcome, with the trace intact
@@ -165,6 +170,8 @@ HELP = """[bold]Type a task in plain language and press Enter.[/]  Commands:
   /demo             start the demo company (mail inbox + bills system) on http://127.0.0.1:8000
   /reset            reset the demo company's data
   /headed           toggle showing the browser window while it works
+  /team             toggle the overseer (splits a request across role-scoped sub-agents)
+  /connectors       list connectors (built and planned) and which roles get them
   /add <task>       queue a task for later        /work    work through the queue unattended
   /status           queue, escalations, metrics   /answer <id> <reply>   answer an escalated task
   /help             this list                     /exit    quit"""
@@ -274,6 +281,15 @@ def repl(console: Console) -> int:
             args.headed = not args.headed
             args.slow = 250 if args.headed else 0
             console.print(f"Browser window: {'shown' if args.headed else 'hidden'}")
+        elif cmd == "/team":
+            args.team = not args.team
+            console.print("Overseer with sub-agents: on" if args.team else "Single worker: on")
+        elif cmd == "/connectors":
+            for c in CONNECTORS.values():
+                colour = "green" if c.status == "built" else "dim"
+                console.print(f"  [{colour}]{c.status:8}[/] {c.name:16} {c.summary} [dim](auth: {c.auth})[/]")
+            for name, role in ROLES.items():
+                console.print(f"  role [bold]{name}[/]: {', '.join(role.connectors)}")
         elif cmd == "/status":
             cmd_status(store, console)
         elif cmd == "/add" and rest:

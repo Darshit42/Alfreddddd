@@ -49,7 +49,7 @@ class Trace:
     # ------------------------------------------------------------------ console
     def _render(self, ev: dict) -> None:
         c, k = self.console, ev["kind"]
-        tag = "[magenta]verifier[/] " if ev.get("role") == "verifier" else ""
+        tag = f"[magenta]{ev['role']}[/] " if ev.get("role") in ("verifier", "overseer") else ""
         if k == "task":
             c.print(Panel(escape(ev["task"]), title="Task", border_style="cyan"))
         elif k == "llm":
@@ -71,7 +71,8 @@ class Trace:
                 lines += ["[bold]Assuming:[/]"] + [f"  - {escape(s)}" for s in ev["assumptions"]]
             c.print(Panel("\n".join(lines), title="Plan", border_style="blue"))
         elif k == "harness":
-            c.print(f"  [yellow]harness:[/] {escape(ev['note'])}")
+            who = "overseer" if ev.get("role") == "overseer" else "harness"
+            c.print(f"  [yellow]{who}:[/] {escape(ev['note'])}")
         elif k == "write" and ev["verdict"] != "allowed":
             c.print(f"  [yellow]enforcer:[/] {ev['method']} {escape(ev['url'])} -> [bold]{ev['verdict']}[/]")
         elif k == "verdict":
